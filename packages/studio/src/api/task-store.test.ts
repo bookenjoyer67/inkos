@@ -78,6 +78,49 @@ describe("Studio task snapshots", () => {
     });
   });
 
+  it("persists mid-flight stream progress so a refresh restores the latest tick", async () => {
+    await saveStudioTaskSnapshot(root, {
+      version: 1,
+      sessionId: "session-4",
+      requestedIntent: "write_next",
+      updatedAt: 20,
+      execution: {
+        id: "task-4",
+        tool: "write_next",
+        label: "写作",
+        status: "running",
+        startedAt: 10,
+        progress: { elapsedMs: 210_000, totalChars: 18432, chineseChars: 13204, status: "streaming", updatedAt: 15 },
+      },
+    });
+
+    await expect(loadStudioTaskSnapshot(root, "session-4")).resolves.toMatchObject({
+      execution: {
+        progress: { elapsedMs: 210_000, totalChars: 18432, chineseChars: 13204, status: "streaming", updatedAt: 15 },
+      },
+    });
+  });
+
+  it("rejects a snapshot whose progress field is malformed", async () => {
+    const path = studioTaskSnapshotPath(root, "session-5");
+    await saveStudioTaskSnapshot(root, {
+      version: 1,
+      sessionId: "session-5",
+      requestedIntent: "write_next",
+      updatedAt: 20,
+      execution: {
+        id: "task-5",
+        tool: "write_next",
+        label: "写作",
+        status: "running",
+        startedAt: 10,
+        progress: { totalChars: "not-a-number" } as never,
+      },
+    });
+
+    await expect(loadStudioTaskSnapshot(root, "session-5")).resolves.toBeNull();
+  });
+
   it("treats a corrupt snapshot as unavailable instead of crashing session restore", async () => {
     const path = studioTaskSnapshotPath(root, "session-3");
     await saveStudioTaskSnapshot(root, {

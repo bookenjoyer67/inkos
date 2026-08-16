@@ -21,7 +21,12 @@ import type { RadarSource } from "../agents/radar-source.js";
 import { readGenreProfile } from "../agents/rules-reader.js";
 import { analyzeAITells } from "../agents/ai-tells.js";
 import { analyzeSensitiveWords } from "../agents/sensitive-words.js";
-import { StateManager } from "../state/manager.js";
+import {
+  StateManager,
+  BOOK_LOCK_WAIT_TIMEOUT_MS,
+  BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
+  BOOK_LOCK_POLL_MS,
+} from "../state/manager.js";
 import { archiveChapterVersion, readChapterUserBrief } from "../state/chapter-workspace.js";
 import { MemoryDB, type Fact } from "../state/memory-db.js";
 import { dispatchNotification, dispatchWebhookEvent } from "../notify/dispatcher.js";
@@ -1235,21 +1240,33 @@ export class PipelineRunner {
     const chapterNumber = await this.state.getNextChapterNumber(bookId);
     const stageLanguage = await this.resolveBookLanguage(book);
     this.logStage(stageLanguage, { zh: "规划下一章意图", en: "planning next chapter intent" });
-    const { plan } = await this.createGovernedArtifacts(
-      book,
-      bookDir,
-      chapterNumber,
-      context ?? this.config.externalContext,
-      { reuseExistingIntentWhenContextMissing: false },
-    );
+    // Runtime artifacts are chapter-scoped: claim chapter:<n> (with a bounded
+    // wait) so plan/compose serializes against a writer producing the same
+    // chapter's runtime files, without blocking other chapters.
+    const releaseLock = await this.state.acquireBookLock(bookId, {
+      scope: { kind: "chapter", chapter: chapterNumber },
+      timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+      pollMs: BOOK_LOCK_POLL_MS,
+    });
+    try {
+      const { plan } = await this.createGovernedArtifacts(
+        book,
+        bookDir,
+        chapterNumber,
+        context ?? this.config.externalContext,
+        { reuseExistingIntentWhenContextMissing: false },
+      );
 
-    return {
-      bookId,
-      chapterNumber,
-      intentPath: relativeToBookDir(bookDir, plan.runtimePath),
-      goal: plan.intent.goal,
-      conflicts: [],
-    };
+      return {
+        bookId,
+        chapterNumber,
+        intentPath: relativeToBookDir(bookDir, plan.runtimePath),
+        goal: plan.intent.goal,
+        conflicts: [],
+      };
+    } finally {
+      await releaseLock();
+    }
   }
 
   async composeChapter(bookId: string, context?: string): Promise<ComposeChapterResult> {
@@ -1259,24 +1276,33 @@ export class PipelineRunner {
     const chapterNumber = await this.state.getNextChapterNumber(bookId);
     const stageLanguage = await this.resolveBookLanguage(book);
     this.logStage(stageLanguage, { zh: "组装章节运行时上下文", en: "composing chapter runtime context" });
-    const { plan, composed } = await this.createGovernedArtifacts(
-      book,
-      bookDir,
-      chapterNumber,
-      context ?? this.config.externalContext,
-      { reuseExistingIntentWhenContextMissing: true },
-    );
+    const releaseLock = await this.state.acquireBookLock(bookId, {
+      scope: { kind: "chapter", chapter: chapterNumber },
+      timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+      pollMs: BOOK_LOCK_POLL_MS,
+    });
+    try {
+      const { plan, composed } = await this.createGovernedArtifacts(
+        book,
+        bookDir,
+        chapterNumber,
+        context ?? this.config.externalContext,
+        { reuseExistingIntentWhenContextMissing: true },
+      );
 
-    return {
-      bookId,
-      chapterNumber,
-      intentPath: relativeToBookDir(bookDir, plan.runtimePath),
-      goal: plan.intent.goal,
-      conflicts: [],
-      contextPath: relativeToBookDir(bookDir, composed.contextPath),
-      ruleStackPath: relativeToBookDir(bookDir, composed.ruleStackPath),
-      tracePath: relativeToBookDir(bookDir, composed.tracePath),
-    };
+      return {
+        bookId,
+        chapterNumber,
+        intentPath: relativeToBookDir(bookDir, plan.runtimePath),
+        goal: plan.intent.goal,
+        conflicts: [],
+        contextPath: relativeToBookDir(bookDir, composed.contextPath),
+        ruleStackPath: relativeToBookDir(bookDir, composed.ruleStackPath),
+        tracePath: relativeToBookDir(bookDir, composed.tracePath),
+      };
+    } finally {
+      await releaseLock();
+    }
   }
 
   /** Audit the latest (or specified) chapter. Read-only, no lock needed. */
@@ -1306,27 +1332,38 @@ export class PipelineRunner {
     });
     const result = evaluation.auditResult;
 
-    // Update index with audit result
-    const index = await this.state.loadChapterIndex(bookId);
-    const updated = index.map((ch) =>
-      ch.number === targetChapter
-        ? {
-            ...ch,
-            status: (result.passed ? "ready-for-review" : "audit-failed") as ChapterMeta["status"],
-            updatedAt: new Date().toISOString(),
-            auditIssues: result.issues.map((i) => `[${i.severity}] ${i.description}`),
-          }
-        : ch,
-    );
-    await this.state.saveChapterIndex(bookId, updated);
-    const latestChapter = index.length > 0 ? Math.max(...index.map((chapter) => chapter.number)) : targetChapter;
-    if (targetChapter === latestChapter) {
-      await this.persistAuditDriftGuidance({
-        bookDir,
-        chapterNumber: targetChapter,
-        issues: result.issues.filter((issue) => issue.severity === "critical" || issue.severity === "warning"),
-        language,
-      }).catch(() => undefined);
+    // Update index with audit result. The index + audit-drift writes are shared
+    // book state, so they go under the short `commit` critical section (waits a
+    // bounded time for an in-flight chapter commit instead of corrupting it).
+    const releaseLock = await this.state.acquireBookLock(bookId, {
+      scope: { kind: "commit" },
+      timeoutMs: BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
+      pollMs: BOOK_LOCK_POLL_MS,
+    });
+    try {
+      const index = await this.state.loadChapterIndex(bookId);
+      const updated = index.map((ch) =>
+        ch.number === targetChapter
+          ? {
+              ...ch,
+              status: (result.passed ? "ready-for-review" : "audit-failed") as ChapterMeta["status"],
+              updatedAt: new Date().toISOString(),
+              auditIssues: result.issues.map((i) => `[${i.severity}] ${i.description}`),
+            }
+          : ch,
+      );
+      await this.state.saveChapterIndex(bookId, updated);
+      const latestChapter = index.length > 0 ? Math.max(...index.map((chapter) => chapter.number)) : targetChapter;
+      if (targetChapter === latestChapter) {
+        await this.persistAuditDriftGuidance({
+          bookDir,
+          chapterNumber: targetChapter,
+          issues: result.issues.filter((issue) => issue.severity === "critical" || issue.severity === "warning"),
+          language,
+        }).catch(() => undefined);
+      }
+    } finally {
+      await releaseLock();
     }
 
     await this.emitWebhook(

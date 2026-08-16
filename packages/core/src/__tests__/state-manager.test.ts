@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, rm, writeFile, readFile, mkdir, stat } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readFile, mkdir, stat, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StateManager } from "../state/manager.js";
@@ -820,6 +820,132 @@ describe("StateManager", () => {
         await release?.();
         vi.useRealTimers();
       }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Lock scopes & waiting acquires
+  // -------------------------------------------------------------------------
+
+  describe("lock scopes & wait", () => {
+    it("writes a distinct lock file per scope", async () => {
+      const bookId = "scope-lock-files";
+      await mkdir(manager.bookDir(bookId), { recursive: true });
+
+      const releaseBook = await manager.acquireBookLock(bookId, { scope: { kind: "book" } });
+      const releaseCommit = await manager.acquireBookLock(bookId, { scope: { kind: "commit" } });
+      const releaseChapter = await manager.acquireBookLock(bookId, { scope: { kind: "chapter", chapter: 3 } });
+
+      const entries = await readdir(manager.bookDir(bookId));
+      expect(entries).toContain(".write.lock");
+      expect(entries).toContain(".commit.lock");
+      expect(entries).toContain(".chapter-3.lock");
+
+      await releaseChapter();
+      await releaseCommit();
+      await releaseBook();
+
+      const after = await readdir(manager.bookDir(bookId));
+      expect(after).not.toContain(".write.lock");
+      expect(after).not.toContain(".commit.lock");
+      expect(after).not.toContain(".chapter-3.lock");
+    });
+
+    it("treats distinct scopes as independent locks", async () => {
+      const bookId = "scope-independent";
+      await mkdir(manager.bookDir(bookId), { recursive: true });
+
+      // Holding the whole-book lock must not block a commit or chapter lock.
+      const releaseBook = await manager.acquireBookLock(bookId, { scope: { kind: "book" } });
+      const releaseCommit = await manager.acquireBookLock(bookId, { scope: { kind: "commit" } });
+      const releaseChapter = await manager.acquireBookLock(bookId, { scope: { kind: "chapter", chapter: 1 } });
+      await releaseChapter();
+      await releaseCommit();
+      await releaseBook();
+    });
+
+    it("serializes same-scope chapter locks", async () => {
+      const bookId = "scope-same-chapter";
+      await mkdir(manager.bookDir(bookId), { recursive: true });
+
+      const release = await manager.acquireBookLock(bookId, { scope: { kind: "chapter", chapter: 5 } });
+      await expect(
+        manager.acquireBookLock(bookId, { scope: { kind: "chapter", chapter: 5 } }),
+      ).rejects.toMatchObject({ code: "BOOK_BUSY" });
+
+      const releaseOther = await manager.acquireBookLock(bookId, { scope: { kind: "chapter", chapter: 6 } });
+      await releaseOther();
+      await release();
+    });
+
+    it("waits for an in-process holder to release when timeoutMs > 0", async () => {
+      const bookId = "scope-wait-acquire";
+      await mkdir(manager.bookDir(bookId), { recursive: true });
+
+      const release = await manager.acquireBookLock(bookId, { scope: { kind: "commit" } });
+      let waiterResolved = false;
+      const waiter = manager.acquireBookLock(bookId, {
+        scope: { kind: "commit" },
+        timeoutMs: 5_000,
+        pollMs: 30,
+      }).then((waiterRelease) => {
+        waiterResolved = true;
+        return waiterRelease;
+      });
+
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 150));
+      expect(waiterResolved).toBe(false);
+
+      await release();
+      const waiterRelease = await waiter;
+      expect(waiterResolved).toBe(true);
+      await waiterRelease();
+    });
+
+    it("gives up waiting after timeoutMs and throws BOOK_BUSY", async () => {
+      const bookId = "scope-wait-timeout";
+      await mkdir(manager.bookDir(bookId), { recursive: true });
+
+      const release = await manager.acquireBookLock(bookId, { scope: { kind: "book" } });
+      try {
+        await expect(
+          manager.acquireBookLock(bookId, { scope: { kind: "book" }, timeoutMs: 150, pollMs: 30 }),
+        ).rejects.toMatchObject({ code: "BOOK_BUSY" });
+      } finally {
+        await release();
+      }
+    });
+
+    it("preserves the immediate BOOK_BUSY default when timeoutMs is 0", async () => {
+      const bookId = "scope-default-timeout";
+      await mkdir(manager.bookDir(bookId), { recursive: true });
+
+      const release = await manager.acquireBookLock(bookId);
+      await expect(manager.acquireBookLock(bookId)).rejects.toMatchObject({ code: "BOOK_BUSY" });
+      await release();
+    });
+  });
+
+  describe("atomic chapter index write", () => {
+    it("does not leave temp files behind and round-trips", async () => {
+      const bookId = "atomic-index";
+      await mkdir(manager.bookDir(bookId), { recursive: true });
+      const chapters: ReadonlyArray<ChapterMeta> = [{
+        number: 1,
+        title: "Ch1",
+        status: "drafted",
+        wordCount: 3000,
+        createdAt: "2026-01-01T00:00:00Z",
+        updatedAt: "2026-01-01T00:00:00Z",
+        auditIssues: [],
+        lengthWarnings: [],
+      }];
+
+      await manager.saveChapterIndex(bookId, chapters);
+      const entries = await readdir(join(manager.bookDir(bookId), "chapters"));
+      expect(entries).toContain("index.json");
+      expect(entries.filter((entry) => entry.includes(".tmp"))).toHaveLength(0);
+      await expect(manager.loadChapterIndex(bookId)).resolves.toEqual(chapters);
     });
   });
 

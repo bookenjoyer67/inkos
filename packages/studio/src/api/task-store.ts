@@ -4,6 +4,14 @@ import type { RequestedIntent } from "@actalk/inkos-core";
 
 export type StudioTaskExecutionStatus = "running" | "processing" | "completed" | "error";
 
+export interface StudioTaskStreamProgress {
+  readonly elapsedMs: number;
+  readonly totalChars: number;
+  readonly chineseChars: number;
+  readonly status: string;
+  readonly updatedAt: number;
+}
+
 export interface StudioTaskExecution {
   readonly id: string;
   readonly tool: string;
@@ -19,6 +27,7 @@ export interface StudioTaskExecution {
     readonly status: "pending" | "active" | "completed";
   }>;
   readonly logs?: ReadonlyArray<string>;
+  readonly progress?: StudioTaskStreamProgress;
   readonly startedAt: number;
   readonly completedAt?: number;
 }
@@ -68,6 +77,19 @@ function parseStudioTaskSnapshot(value: unknown): StudioTaskSnapshot | null {
   ) return null;
   if (execution.logs !== undefined && (!Array.isArray(execution.logs) || execution.logs.some((log) => typeof log !== "string"))) {
     return null;
+  }
+  if (execution.progress !== undefined) {
+    const progress = execution.progress;
+    if (
+      !isRecord(progress)
+      || typeof progress.elapsedMs !== "number"
+      || typeof progress.totalChars !== "number"
+      || typeof progress.chineseChars !== "number"
+      || typeof progress.status !== "string"
+      || typeof progress.updatedAt !== "number"
+    ) {
+      return null;
+    }
   }
 
   return value as unknown as StudioTaskSnapshot;

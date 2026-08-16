@@ -33,6 +33,7 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
     async loadBookConfig(): Promise<never> { throw new Error("not implemented"); }
     async loadChapterIndex(): Promise<[]> { return []; }
     async getNextChapterNumber(): Promise<number> { return 1; }
+    async acquireBookLock(): Promise<() => Promise<void>> { return async () => undefined; }
     bookDir(id: string): string { return join(this.root, "books", id); }
   }
   class MockPipelineRunner {
@@ -61,6 +62,9 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
 
   return {
     StateManager: MockStateManager,
+    BOOK_LOCK_WAIT_TIMEOUT_MS: actual.BOOK_LOCK_WAIT_TIMEOUT_MS,
+    BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS: actual.BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
+    BOOK_LOCK_POLL_MS: actual.BOOK_LOCK_POLL_MS,
     PipelineRunner: MockPipelineRunner,
     Scheduler: MockScheduler,
     isNewLayoutBook,

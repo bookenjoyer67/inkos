@@ -8,8 +8,14 @@ import type {
   ReviseMode,
   LLMClient,
   BookConfig,
+  BookLockScope,
 } from "../index.js";
-import { chatCompletion } from "../index.js";
+import {
+  chatCompletion,
+  BOOK_LOCK_WAIT_TIMEOUT_MS,
+  BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
+  BOOK_LOCK_POLL_MS,
+} from "../index.js";
 import { executeEditTransaction } from "./edit-controller.js";
 import { defaultChapterLength } from "../utils/length-metrics.js";
 import type { InteractionRuntimeTools } from "./runtime.js";
@@ -138,8 +144,11 @@ async function withBookMutationLock<T>(
   state: StateLike,
   bookId: string,
   task: () => Promise<T>,
+  options: { readonly scope?: BookLockScope; readonly timeoutMs?: number; readonly pollMs?: number } = {},
 ): Promise<T> {
-  const releaseLock = await state.acquireBookLock(bookId);
+  const releaseLock = Object.keys(options).length > 0
+    ? await state.acquireBookLock(bookId, options)
+    : await state.acquireBookLock(bookId);
   try {
     return await task();
   } finally {
@@ -454,50 +463,88 @@ export function createInteractionToolsFromDeps(
       bookId,
       () => pipeline.reviseDraft(bookId, chapterNumber, mode as ReviseMode),
     ),
-    patchChapterText: async (bookId, chapterNumber, targetText, replacementText) => withBookMutationLock(state, bookId, async () => {
-      const execution = await executeEditTransaction(
-        {
-          bookDir: (targetBookId) => state.bookDir(targetBookId),
-          loadChapterIndex: (targetBookId) => state.loadChapterIndex(targetBookId),
-          saveChapterIndex: (targetBookId, index) => state.saveChapterIndex(targetBookId, index),
-        },
-        {
-          kind: "chapter-local-edit",
-          bookId,
-          chapterNumber,
-          instruction: `Replace ${targetText} with ${replacementText}`,
-          targetText,
-          replacementText,
-        },
-      );
-      return {
-        __interaction: {
-          activeChapterNumber: chapterNumber,
-          responseText: execution.summary,
-        },
-      };
-    }),
-    replaceChapterText: async (bookId, chapterNumber, fullText) => withBookMutationLock(state, bookId, async () => {
-      const execution = await executeEditTransaction(
-        {
-          bookDir: (targetBookId) => state.bookDir(targetBookId),
-          loadChapterIndex: (targetBookId) => state.loadChapterIndex(targetBookId),
-          saveChapterIndex: (targetBookId, index) => state.saveChapterIndex(targetBookId, index),
-        },
-        {
-          kind: "chapter-replace",
-          bookId,
-          chapterNumber,
-          fullText,
-        },
-      );
-      return {
-        __interaction: {
-          activeChapterNumber: chapterNumber,
-          responseText: execution.summary,
-        },
-      };
-    }),
+    patchChapterText: async (bookId, chapterNumber, targetText, replacementText) => withBookMutationLock(
+      state,
+      bookId,
+      async () => {
+        // Index merge is shared book state; serialize it under the short commit
+        // section (chapter lock already held by the outer helper).
+        const releaseCommitLock = await state.acquireBookLock(bookId, {
+          scope: { kind: "commit" },
+          timeoutMs: BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
+          pollMs: BOOK_LOCK_POLL_MS,
+        });
+        try {
+          const execution = await executeEditTransaction(
+            {
+              bookDir: (targetBookId) => state.bookDir(targetBookId),
+              loadChapterIndex: (targetBookId) => state.loadChapterIndex(targetBookId),
+              saveChapterIndex: (targetBookId, index) => state.saveChapterIndex(targetBookId, index),
+            },
+            {
+              kind: "chapter-local-edit",
+              bookId,
+              chapterNumber,
+              instruction: `Replace ${targetText} with ${replacementText}`,
+              targetText,
+              replacementText,
+            },
+          );
+          return {
+            __interaction: {
+              activeChapterNumber: chapterNumber,
+              responseText: execution.summary,
+            },
+          };
+        } finally {
+          await releaseCommitLock();
+        }
+      },
+      {
+        scope: { kind: "chapter", chapter: chapterNumber },
+        timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+        pollMs: BOOK_LOCK_POLL_MS,
+      },
+    ),
+    replaceChapterText: async (bookId, chapterNumber, fullText) => withBookMutationLock(
+      state,
+      bookId,
+      async () => {
+        const releaseCommitLock = await state.acquireBookLock(bookId, {
+          scope: { kind: "commit" },
+          timeoutMs: BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
+          pollMs: BOOK_LOCK_POLL_MS,
+        });
+        try {
+          const execution = await executeEditTransaction(
+            {
+              bookDir: (targetBookId) => state.bookDir(targetBookId),
+              loadChapterIndex: (targetBookId) => state.loadChapterIndex(targetBookId),
+              saveChapterIndex: (targetBookId, index) => state.saveChapterIndex(targetBookId, index),
+            },
+            {
+              kind: "chapter-replace",
+              bookId,
+              chapterNumber,
+              fullText,
+            },
+          );
+          return {
+            __interaction: {
+              activeChapterNumber: chapterNumber,
+              responseText: execution.summary,
+            },
+          };
+        } finally {
+          await releaseCommitLock();
+        }
+      },
+      {
+        scope: { kind: "chapter", chapter: chapterNumber },
+        timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+        pollMs: BOOK_LOCK_POLL_MS,
+      },
+    ),
     renameEntity: async (bookId, oldValue, newValue) => withBookMutationLock(state, bookId, async () => {
       const execution = await executeEditTransaction(
         {

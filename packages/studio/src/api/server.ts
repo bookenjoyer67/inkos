@@ -127,11 +127,15 @@ import {
   type RequestedIntent,
   type SessionKind,
   type AgentSessionAttachment,
+  BOOK_LOCK_WAIT_TIMEOUT_MS,
+  BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
+  BOOK_LOCK_POLL_MS,
 } from "@actalk/inkos-core";
 import { access, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { isSafeBookId } from "./safety.js";
 import { ApiError } from "./errors.js";
+import { formatStreamProgressTick, type StreamProgressLike } from "./lib/stream-tick.js";
 import { buildStudioBookConfig } from "./book-create.js";
 import {
   deleteStudioTaskSnapshot,
@@ -1359,6 +1363,7 @@ interface CollectedToolExec {
   error?: string;
   stages?: Array<{ label: string; status: "pending" | "completed" }>;
   logs?: string[];
+  progress?: { readonly elapsedMs: number; readonly totalChars: number; readonly chineseChars: number; readonly status: string; readonly updatedAt: number };
   startedAt: number;
   completedAt?: number;
 }
@@ -1619,6 +1624,8 @@ async function executeConfirmedProductionAction(args: {
   readonly sourceRequestId?: string;
   readonly signal: AbortSignal;
   readonly onTaskChange: (exec: CollectedToolExec) => Promise<void>;
+  // pipeline 构建早于 exec 创建，llm:progress 通过这个占位对象转发到 exec 持久化。
+  readonly onStreamProgressRelay?: { onProgress?: (progress: StreamProgressLike) => void };
 }): Promise<CollectedToolExec> {
   const lang = args.language ?? "zh";
   const id = args.taskId;
@@ -1825,8 +1832,14 @@ async function executeConfirmedProductionAction(args: {
     stages: agent ? pipelineStages(agent, lang)?.map(label => ({ label, status: "pending" as const })) : undefined,
     startedAt: Date.now(),
   };
-
   await args.onTaskChange(exec);
+
+  // 把 pipeline 的流式进度桥接到任务快照：每次 tick（含收尾的 done）覆盖
+  // exec.progress 并持久化，刷新页面后任务卡能从快照拿到最近一次的进度数字。
+  args.onStreamProgressRelay && (args.onStreamProgressRelay.onProgress = (progress) => {
+    exec.progress = { ...progress, updatedAt: Date.now() };
+    void args.onTaskChange(exec).catch(() => undefined);
+  });
 
   // background: true 标明这是后台生产任务的工具启动（聊天轮工具不带）。
   // free-text 命中写章启发式时前端在发送时无法预知这轮会按任务执行，
@@ -2873,6 +2886,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         ...exec,
         ...(exec.stages ? { stages: exec.stages.map((stage) => ({ ...stage })) } : {}),
         ...(exec.logs ? { logs: [...exec.logs] } : {}),
+        ...(exec.progress ? { progress: { ...exec.progress } } : {}),
       },
     };
     await saveStudioTaskSnapshot(root, snapshot);
@@ -3004,6 +3018,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       // 事件维持只带 sessionId，走"最近一张运行中卡"的回退。
       readonly executionIdForSSE?: string;
       readonly bookIdForSettings?: string;
+      // 确认式生产任务把 llm:progress 持久化到任务快照的桥：任务分支在构建
+      // pipeline 时先占位空对象，待 exec 创建后再把 onProgress 接上（exec 的
+      // 生命周期晚于 pipeline 构建）。不带则进度事件仅广播、不落盘。
+      readonly onStreamProgressRelay?: { onProgress?: (progress: StreamProgressLike) => void };
     },
   ): Promise<PipelineConfig> {
     const currentConfig = overrides?.currentConfig ?? await loadCurrentProjectConfig();
@@ -3014,6 +3032,15 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const sseExecutionTag = overrides?.executionIdForSSE
       ? { executionId: overrides.executionIdForSSE }
       : {};
+    let currentStage: string | undefined;
+    const stageTrackingSink = (inner: LogSink): LogSink => ({
+      write(entry) {
+        if (entry.message.startsWith("Stage: ") || entry.message.startsWith("阶段：")) {
+          currentStage = entry.message;
+        }
+        inner.write(entry);
+      },
+    });
     const scopedSseSink: LogSink = overrides?.sessionIdForSSE
       ? {
           write(entry) {
@@ -3027,7 +3054,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           },
         }
       : sseSink;
-    const logger = createLogger({ tag: "studio", sinks: [scopedSseSink, consoleSink] });
+    const logger = createLogger({
+      tag: "studio",
+      sinks: [stageTrackingSink(scopedSseSink), stageTrackingSink(consoleSink)],
+    });
     return {
       client: overrides?.client ?? createLLMClient(currentConfig.llm),
       model: overrides?.model ?? currentConfig.llm.model,
@@ -3056,6 +3086,19 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           totalChars: progress.totalChars,
           chineseChars: progress.chineseChars,
         });
+        if (progress.status === "streaming") {
+          consoleSink.write({
+            level: "info",
+            tag: "studio",
+            message: formatStreamProgressTick(progress, {
+              taskId: overrides?.executionIdForSSE,
+              sessionId: overrides?.sessionIdForSSE,
+              stage: currentStage,
+            }),
+            timestamp: new Date().toISOString(),
+          });
+        }
+        overrides?.onStreamProgressRelay?.onProgress?.(progress);
       },
       externalContext: overrides?.externalContext,
     };
@@ -3341,7 +3384,16 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
   app.post("/api/v1/books/:id/chapters/:num/versions/:versionId/restore", async (c) => {
     const id = c.req.param("id");
     const num = parseInt(c.req.param("num"), 10);
-    const releaseLock = await state.acquireBookLock(id);
+    const releaseChapterLock = await state.acquireBookLock(id, {
+      scope: { kind: "chapter", chapter: num },
+      timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+      pollMs: BOOK_LOCK_POLL_MS,
+    });
+    const releaseCommitLock = await state.acquireBookLock(id, {
+      scope: { kind: "commit" },
+      timeoutMs: BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
+      pollMs: BOOK_LOCK_POLL_MS,
+    });
     try {
       const fullText = await readChapterVersion(
         state.bookDir(id),
@@ -3367,7 +3419,8 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     } catch (e) {
       return c.json({ error: e instanceof Error ? e.message : String(e) }, 500);
     } finally {
-      await releaseLock();
+      await releaseCommitLock();
+      await releaseChapterLock();
     }
   });
 
@@ -3393,7 +3446,20 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const num = parseInt(c.req.param("num"), 10);
     const { content } = await c.req.json<{ content: string }>();
 
-    const releaseLock = await state.acquireBookLock(id);
+    // Chapter-scoped write (chapter body + version archive + runtime cleanup)
+    // plus the short commit section for the index merge, so editing chapter M
+    // proceeds while a write job on another chapter runs. Same-chapter edits
+    // serialize against each other; the index write is serialized under commit.
+    const releaseChapterLock = await state.acquireBookLock(id, {
+      scope: { kind: "chapter", chapter: num },
+      timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+      pollMs: BOOK_LOCK_POLL_MS,
+    });
+    const releaseCommitLock = await state.acquireBookLock(id, {
+      scope: { kind: "commit" },
+      timeoutMs: BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
+      pollMs: BOOK_LOCK_POLL_MS,
+    });
     try {
       const result = await executeEditTransaction(
         {
@@ -3413,7 +3479,8 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     } catch (e) {
       return c.json({ error: String(e) }, 500);
     } finally {
-      await releaseLock();
+      await releaseCommitLock();
+      await releaseChapterLock();
     }
   });
 
@@ -3684,11 +3751,20 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const num = parseInt(c.req.param("num"), 10);
 
     try {
-      const index = await state.loadChapterIndex(id);
-      const updated = index.map((ch) =>
-        ch.number === num ? { ...ch, status: "approved" as const } : ch,
-      );
-      await state.saveChapterIndex(id, updated);
+      const releaseLock = await state.acquireBookLock(id, {
+        scope: { kind: "commit" },
+        timeoutMs: BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
+        pollMs: BOOK_LOCK_POLL_MS,
+      });
+      try {
+        const index = await state.loadChapterIndex(id);
+        const updated = index.map((ch) =>
+          ch.number === num ? { ...ch, status: "approved" as const } : ch,
+        );
+        await state.saveChapterIndex(id, updated);
+      } finally {
+        await releaseLock();
+      }
       return c.json({ ok: true, chapterNumber: num, status: "approved" });
     } catch (e) {
       return c.json({ error: String(e) }, 500);
@@ -3706,15 +3782,26 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         return c.json({ error: `Chapter ${num} not found` }, 404);
       }
 
-      const rollbackTarget = num - 1;
-      const discarded = await state.rollbackToChapter(id, rollbackTarget);
-      return c.json({
-        ok: true,
-        chapterNumber: num,
-        status: "rejected",
-        rolledBackTo: rollbackTarget,
-        discarded,
+      // rollbackToChapter rewrites the whole book truth set; take the exclusive
+      // book lock and wait for any in-flight write to finish before rolling back.
+      const releaseLock = await state.acquireBookLock(id, {
+        scope: { kind: "book" },
+        timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+        pollMs: BOOK_LOCK_POLL_MS,
       });
+      try {
+        const rollbackTarget = num - 1;
+        const discarded = await state.rollbackToChapter(id, rollbackTarget);
+        return c.json({
+          ok: true,
+          chapterNumber: num,
+          status: "rejected",
+          rolledBackTo: rollbackTarget,
+          discarded,
+        });
+      } finally {
+        await releaseLock();
+      }
     } catch (e) {
       return c.json({ error: String(e) }, 500);
     }
@@ -5162,6 +5249,11 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       // 不带这个 id，前端才能把任务日志与聊天轮工具日志分开归属。
       const confirmedTaskId = confirmedIntent ? `direct-${confirmedIntent}-${randomUUID()}` : undefined;
 
+      // pipeline 构建早于任务 exec 创建：先占位进度转发对象，exec 创建后再由
+      // executeConfirmedProductionAction 把 onProgress 接上，llm:progress 才能
+      // 持久化到任务快照。
+      const taskProgressRelay: { onProgress?: (progress: StreamProgressLike) => void } = {};
+
       const pipeline = new PipelineRunner(await buildPipelineConfig({
         client: pipelineClient,
         model: reqModel ?? config.llm.model,
@@ -5169,6 +5261,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         sessionIdForSSE: bookSession.sessionId,
         bookIdForSettings: activeBookId ?? undefined,
         ...(confirmedTaskId ? { executionIdForSSE: confirmedTaskId } : {}),
+        ...(confirmedTaskId ? { onStreamProgressRelay: taskProgressRelay } : {}),
       }));
 
       if (confirmedIntent && confirmedTaskId) {
@@ -5243,6 +5336,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
             taskId,
             sourceRequestId,
             signal: taskController.signal,
+            onStreamProgressRelay: taskProgressRelay,
             onTaskChange: (taskExec) => persistConfirmedTask(
               bookSession.sessionId,
               confirmedIntent,
@@ -6013,9 +6107,20 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const { content } = await c.req.json<{ content: string }>();
     const { writeFile: writeFileFs, mkdir: mkdirFs } = await import("node:fs/promises");
     const { dirname: dirnameFs } = await import("node:path");
-    await mkdirFs(dirnameFs(resolved), { recursive: true });
-    await writeFileFs(resolved, content, "utf-8");
-    return c.json({ ok: true });
+    // Truth files are shared book state; take the exclusive book lock (with a
+    // bounded wait) so a concurrent write's commit cannot clobber this edit.
+    const releaseLock = await state.acquireBookLock(id, {
+      scope: { kind: "book" },
+      timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+      pollMs: BOOK_LOCK_POLL_MS,
+    });
+    try {
+      await mkdirFs(dirnameFs(resolved), { recursive: true });
+      await writeFileFs(resolved, content, "utf-8");
+      return c.json({ ok: true });
+    } finally {
+      await releaseLock();
+    }
   });
 
   // =============================================

@@ -30,6 +30,13 @@ export interface ToolExecution {
   error?: string;
   stages?: PipelineStage[];
   logs?: string[];
+  progress?: {
+    readonly elapsedMs: number;
+    readonly totalChars: number;
+    readonly chineseChars: number;
+    readonly status: string;
+    readonly updatedAt: number;
+  };
   startedAt: number;
   completedAt?: number;
   // 后台生产任务的工具卡（来自带 background 标记的 tool:start 或任务快照恢复）。

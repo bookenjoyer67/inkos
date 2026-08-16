@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir, readdir, rm, stat, unlink, open } from "node:fs/promises";
+import { readFile, writeFile, mkdir, readdir, rm, stat, unlink, open, rename } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import type { BookConfig } from "../models/book.js";
@@ -8,6 +8,31 @@ import { bootstrapStructuredStateFromMarkdown, resolveDurableStoryProgress } fro
 const BOOK_LOCK_HEARTBEAT_MS = 30_000;
 const BOOK_LOCK_LEASE_MS = 3 * 60_000;
 const BOOK_LOCK_RELEASE_RETRIES = 4;
+
+// Defaults for waiting lock acquires (Phase 1: infra only; consumers opt in by
+// passing a timeoutMs > 0). Book-scope waits can legitimately span a whole
+// write job (~10 min), so the default is generous; commit-scope holds are
+// sub-second by design.
+export const BOOK_LOCK_WAIT_TIMEOUT_MS = 30 * 60_000;
+export const BOOK_LOCK_POLL_MS = 2_000;
+// Commit-scope critical sections are sub-second by design (deterministic tail
+// only), so a 60s wait is generous headroom and fails fast if something stalls.
+export const BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS = 60_000;
+
+// A lock scope selects which lock file is acquired for a book. Distinct
+// scopes are independent locks: two tasks holding different scopes can run
+// concurrently, while same-scope holders serialize.
+export type BookLockScope =
+  | { readonly kind: "book" }
+  | { readonly kind: "commit" }
+  | { readonly kind: "chapter"; readonly chapter: number };
+
+export interface AcquireBookLockOptions {
+  readonly scope?: BookLockScope;
+  // >0: poll for the lock up to this many ms instead of failing immediately.
+  readonly timeoutMs?: number;
+  readonly pollMs?: number;
+}
 
 interface BookLockMetadata {
   readonly version: 1;
@@ -133,9 +158,39 @@ export class StateManager {
     }
   }
 
-  async acquireBookLock(bookId: string): Promise<() => Promise<void>> {
+  async acquireBookLock(bookId: string, options: AcquireBookLockOptions = {}): Promise<() => Promise<void>> {
+    const scope = options.scope ?? { kind: "book" as const };
+    const timeoutMs = options.timeoutMs ?? 0;
+    if (timeoutMs > 0) {
+      const deadline = Date.now() + timeoutMs;
+      const pollMs = options.pollMs ?? BOOK_LOCK_POLL_MS;
+      for (;;) {
+        try {
+          return await this.acquireBookLockOnce(bookId, scope);
+        } catch (error) {
+          if (!(error instanceof BookWriteLockError)) throw error;
+          if (Date.now() >= deadline) throw error;
+          await new Promise((resolveDelay) => setTimeout(resolveDelay, pollMs));
+        }
+      }
+    }
+    return this.acquireBookLockOnce(bookId, scope);
+  }
+
+  private lockFileNameForScope(scope: BookLockScope): string {
+    switch (scope.kind) {
+      case "book":
+        return ".write.lock";
+      case "commit":
+        return ".commit.lock";
+      case "chapter":
+        return `.chapter-${scope.chapter}.lock`;
+    }
+  }
+
+  private async acquireBookLockOnce(bookId: string, scope: BookLockScope): Promise<() => Promise<void>> {
     await mkdir(this.bookDir(bookId), { recursive: true });
-    const lockPath = join(this.bookDir(bookId), ".write.lock");
+    const lockPath = join(this.bookDir(bookId), this.lockFileNameForScope(scope));
     const lockKey = this.normalizeLockKey(lockPath);
     const existingOwner = processBookLocks.get(lockKey);
     if (existingOwner) {
@@ -547,11 +602,15 @@ export class StateManager {
     const safeIndex = index.length === 0 && !options.allowEmptyWithChapterFiles
       ? await this.rebuildChapterIndexFromFilesAt(bookDir).then((rebuilt) => rebuilt.length > 0 ? rebuilt : index)
       : index;
-    await writeFile(
-      join(chaptersDir, "index.json"),
-      JSON.stringify(safeIndex, null, 2),
-      "utf-8",
-    );
+    const indexPath = join(chaptersDir, "index.json");
+    const tmpPath = join(chaptersDir, `index.json.${process.pid}.${randomUUID()}.tmp`);
+    try {
+      await writeFile(tmpPath, JSON.stringify(safeIndex, null, 2), "utf-8");
+      await rename(tmpPath, indexPath);
+    } catch (error) {
+      await unlink(tmpPath).catch(() => undefined);
+      throw error;
+    }
   }
 
   async snapshotState(bookId: string, chapterNumber: number): Promise<void> {

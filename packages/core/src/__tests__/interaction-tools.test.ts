@@ -121,9 +121,16 @@ describe("interaction tools", () => {
       await tools.renameEntity("harbor", "Alpha", "Beta");
       await tools.patchChapterText("harbor", 1, "Gamma", "Delta");
 
+      // renameEntity is book-wide -> whole-book lock.
       expect(acquireBookLock).toHaveBeenNthCalledWith(1, "harbor");
-      expect(acquireBookLock).toHaveBeenNthCalledWith(2, "harbor");
-      expect(releases).toBe(2);
+      // patchChapterText claims the chapter scope + the short commit section.
+      expect(acquireBookLock).toHaveBeenNthCalledWith(2, "harbor", expect.objectContaining({
+        scope: { kind: "chapter", chapter: 1 },
+      }));
+      expect(acquireBookLock).toHaveBeenNthCalledWith(3, "harbor", expect.objectContaining({
+        scope: { kind: "commit" },
+      }));
+      expect(releases).toBe(3);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

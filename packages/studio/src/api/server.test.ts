@@ -24,6 +24,7 @@ const rollbackToChapterMock = vi.fn();
 const deleteLatestChapterMock = vi.fn();
 const saveChapterIndexMock = vi.fn();
 const loadChapterIndexMock = vi.fn();
+const acquireBookLockMock = vi.fn<(...args: unknown[]) => Promise<() => Promise<void>>>(async () => async () => undefined);
 const loadBookConfigMock = vi.fn();
 const createLLMClientMock = vi.fn(() => ({}));
 const chatCompletionMock = vi.fn();
@@ -184,8 +185,8 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
       return (await rollbackToChapterMock(bookId, chapterNumber)) as number[];
     }
 
-    async acquireBookLock(): Promise<() => Promise<void>> {
-      return async () => undefined;
+    async acquireBookLock(...args: unknown[]): Promise<() => Promise<void>> {
+      return await acquireBookLockMock(...args) as () => Promise<void>;
     }
 
     async getNextChapterNumber(_bookId?: string): Promise<number> {
@@ -264,6 +265,9 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
 
   return {
     StateManager: MockStateManager,
+    BOOK_LOCK_WAIT_TIMEOUT_MS: actual.BOOK_LOCK_WAIT_TIMEOUT_MS,
+    BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS: actual.BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
+    BOOK_LOCK_POLL_MS: actual.BOOK_LOCK_POLL_MS,
     PipelineRunner: MockPipelineRunner,
     Scheduler: MockScheduler,
     createLLMClient: createLLMClientMock,
@@ -622,6 +626,8 @@ describe("createStudioServer daemon lifecycle", () => {
     loadSecretsMock.mockReset();
     saveSecretsMock.mockReset();
     getServiceApiKeyMock.mockReset();
+    acquireBookLockMock.mockReset();
+    acquireBookLockMock.mockResolvedValue(async () => undefined);
     resolveServicePresetMock.mockClear();
     resolveServiceProviderFamilyMock.mockClear();
     resolveServiceModelsBaseUrlMock.mockClear();
@@ -2807,6 +2813,13 @@ describe("createStudioServer daemon lifecycle", () => {
       join(root, "books", "demo-book", "chapters", "0003_Demo.md"),
       "utf-8",
     )).resolves.toContain("人工修改后的正文");
+    // Manual save claims the chapter scope + commit section, not the whole book.
+    expect(acquireBookLockMock).toHaveBeenCalledWith("demo-book", expect.objectContaining({
+      scope: { kind: "chapter", chapter: 3 },
+    }));
+    expect(acquireBookLockMock).toHaveBeenCalledWith("demo-book", expect.objectContaining({
+      scope: { kind: "commit" },
+    }));
     const versionFiles = await (await import("node:fs/promises")).readdir(
       join(root, "books", "demo-book", "chapters", ".versions", "0003"),
     );
@@ -2907,6 +2920,14 @@ describe("createStudioServer daemon lifecycle", () => {
     expect(restoreResponse.status).toBe(200);
     await expect(readFile(join(bookDir, "chapters", "0003_Demo.md"), "utf-8"))
       .resolves.toContain("恢复后的正文");
+    // Version restore claims the chapter scope + commit section, not the book.
+    expect(acquireBookLockMock).toHaveBeenCalledWith("demo-book", expect.objectContaining({
+      scope: { kind: "chapter", chapter: 3 },
+    }));
+    expect(acquireBookLockMock).toHaveBeenCalledWith("demo-book", expect.objectContaining({
+      scope: { kind: "commit" },
+    }));
+    acquireBookLockMock.mockClear();
 
     const deleteResponse = await app.request(
       "http://localhost/api/v1/books/demo-book/chapters/3",
@@ -2918,6 +2939,8 @@ describe("createStudioServer daemon lifecycle", () => {
       "demo-book",
       { chapterNumber: 3 },
     );
+    // Chapter deletion is a whole-book rollback: still the default book lock.
+    expect(acquireBookLockMock).toHaveBeenCalledWith("demo-book");
   });
 
   it("exposes a resync endpoint for rebuilding latest chapter truth artifacts", async () => {
