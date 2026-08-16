@@ -2590,6 +2590,216 @@ describe("PipelineRunner", () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  it("runs two writeNextChapter calls concurrently via reservations and the journal applier", async () => {
+    const { root, runner, state, bookId } = await createRunnerFixture({
+      inputGovernanceMode: "legacy",
+      concurrentWrites: true,
+    });
+    const storyDir = join(state.bookDir(bookId), "story");
+    await mkdir(join(storyDir, "state"), { recursive: true });
+    await Promise.all([
+      writeFile(join(storyDir, "state", "manifest.json"), JSON.stringify({
+        schemaVersion: 2,
+        language: "en",
+        lastAppliedChapter: 0,
+        projectionVersion: 1,
+        migrationWarnings: [],
+      }, null, 2), "utf-8"),
+      writeFile(join(storyDir, "state", "current_state.json"), JSON.stringify({ chapter: 0, facts: [] }, null, 2), "utf-8"),
+      writeFile(join(storyDir, "state", "hooks.json"), JSON.stringify({ hooks: [] }, null, 2), "utf-8"),
+      writeFile(join(storyDir, "state", "chapter_summaries.json"), JSON.stringify({ rows: [] }, null, 2), "utf-8"),
+      writeFile(join(storyDir, "current_state.md"), createStateCard({
+        chapter: 0,
+        location: "Start",
+        protagonistState: "New",
+        goal: "Begin",
+        conflict: "None",
+      }), "utf-8"),
+      writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n", "utf-8"),
+      writeFile(join(storyDir, "chapter_summaries.md"), "# Chapter Summaries\n", "utf-8"),
+    ]);
+
+    vi.spyOn(WriterAgent.prototype, "writeChapter").mockImplementation(async (input) => {
+      const chapter = input.chapterNumber;
+      return createWriterOutput({
+        chapterNumber: chapter,
+        content: `Chapter ${chapter} body.`,
+        wordCount: countChapterLength(`Chapter ${chapter} body.`, "en_words"),
+        postWriteErrors: [],
+        postWriteWarnings: [],
+        runtimeStateDelta: {
+          chapter,
+          currentStatePatch: { currentGoal: `Goal for chapter ${chapter}` },
+          hookOps: { upsert: [], mention: [], resolve: [], defer: [] },
+          newHookCandidates: [],
+          chapterSummary: {
+            chapter,
+            title: `Chapter ${chapter}`,
+            characters: "Lin Yue",
+            events: `Events for ${chapter}.`,
+            stateChanges: `State for ${chapter}.`,
+            hookActivity: "none",
+            mood: "tight",
+            chapterType: "mainline",
+          },
+          subplotOps: [],
+          emotionalArcOps: [],
+          characterMatrixOps: [],
+          notes: [],
+        },
+      });
+    });
+    vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValue(
+      createAuditResult({ passed: true, issues: [], summary: "clean" }),
+    );
+
+    const [r1, r2] = await Promise.all([
+      runner.writeNextChapter(bookId),
+      runner.writeNextChapter(bookId),
+    ]);
+    expect([r1.chapterNumber, r2.chapterNumber].sort()).toEqual([1, 2]);
+
+    // Both chapter files and both delta journals exist.
+    const chaptersDir = join(state.bookDir(bookId), "chapters");
+    const chapterFiles = await readdir(chaptersDir);
+    expect(chapterFiles.filter((file) => file.endsWith(".md"))).toHaveLength(2);
+    const runtimeFiles = await readdir(join(storyDir, "runtime"));
+    expect(runtimeFiles.filter((file) => file.endsWith(".delta.json"))).toHaveLength(2);
+
+    // Reservations are released after both writes finish.
+    await expect(state.listActiveChapterReservations(bookId)).resolves.toEqual([]);
+
+    // The applier merged both deltas in ascending order without regressing.
+    const manifest = JSON.parse(await readFile(join(storyDir, "state", "manifest.json"), "utf-8"));
+    expect(manifest.lastAppliedChapter).toBe(2);
+    const stateCurrent = JSON.parse(await readFile(join(storyDir, "state", "current_state.json"), "utf-8"));
+    expect(stateCurrent.chapter).toBe(2);
+    const stateSummaries = JSON.parse(await readFile(join(storyDir, "state", "chapter_summaries.json"), "utf-8"));
+    expect(stateSummaries.rows.map((row: { chapter: number }) => row.chapter)).toEqual([1, 2]);
+    const currentStateMarkdown = await readFile(join(storyDir, "current_state.md"), "utf-8");
+    expect(currentStateMarkdown).toContain("Goal for chapter 2");
+
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("applies an out-of-order concurrent commit without regressing applied state", async () => {
+    const { root, runner, state, bookId } = await createRunnerFixture({
+      inputGovernanceMode: "legacy",
+      concurrentWrites: true,
+    });
+    const storyDir = join(state.bookDir(bookId), "story");
+    await mkdir(join(storyDir, "state"), { recursive: true });
+    await Promise.all([
+      writeFile(join(storyDir, "state", "manifest.json"), JSON.stringify({
+        schemaVersion: 2,
+        language: "en",
+        lastAppliedChapter: 0,
+        projectionVersion: 1,
+        migrationWarnings: [],
+      }, null, 2), "utf-8"),
+      writeFile(join(storyDir, "state", "current_state.json"), JSON.stringify({ chapter: 0, facts: [] }, null, 2), "utf-8"),
+      writeFile(join(storyDir, "state", "hooks.json"), JSON.stringify({ hooks: [] }, null, 2), "utf-8"),
+      writeFile(join(storyDir, "state", "chapter_summaries.json"), JSON.stringify({ rows: [] }, null, 2), "utf-8"),
+      writeFile(join(storyDir, "current_state.md"), createStateCard({
+        chapter: 0,
+        location: "Start",
+        protagonistState: "New",
+        goal: "Begin",
+        conflict: "None",
+      }), "utf-8"),
+      writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n", "utf-8"),
+      writeFile(join(storyDir, "chapter_summaries.md"), "# Chapter Summaries\n", "utf-8"),
+    ]);
+
+    // Chapter 1 is slow so chapter 2 commits first -> chapter 1 lands out of order.
+    vi.spyOn(WriterAgent.prototype, "writeChapter").mockImplementation(async (input) => {
+      const chapter = input.chapterNumber;
+      if (chapter === 1) {
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 150));
+      }
+      return createWriterOutput({
+        chapterNumber: chapter,
+        content: `Chapter ${chapter} body.`,
+        wordCount: countChapterLength(`Chapter ${chapter} body.`, "en_words"),
+        postWriteErrors: [],
+        postWriteWarnings: [],
+        runtimeStateDelta: {
+          chapter,
+          currentStatePatch: { currentGoal: `Goal for chapter ${chapter}` },
+          hookOps: { upsert: [], mention: [], resolve: [], defer: [] },
+          newHookCandidates: [],
+          chapterSummary: {
+            chapter,
+            title: `Chapter ${chapter}`,
+            characters: "Lin Yue",
+            events: `Events for ${chapter}.`,
+            stateChanges: `State for ${chapter}.`,
+            hookActivity: "none",
+            mood: "tight",
+            chapterType: "mainline",
+          },
+          subplotOps: [],
+          emotionalArcOps: [],
+          characterMatrixOps: [],
+          notes: [],
+        },
+      });
+    });
+    vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValue(
+      createAuditResult({ passed: true, issues: [], summary: "clean" }),
+    );
+
+    const [r1, r2] = await Promise.all([
+      runner.writeNextChapter(bookId),
+      runner.writeNextChapter(bookId),
+    ]);
+    expect([r1.chapterNumber, r2.chapterNumber].sort()).toEqual([1, 2]);
+
+    // Chapter 2's goal is the current goal (it committed last as the higher chapter).
+    const stateCurrent = JSON.parse(await readFile(join(storyDir, "state", "current_state.json"), "utf-8"));
+    expect(stateCurrent.chapter).toBe(2);
+    const currentStateMarkdown = await readFile(join(storyDir, "current_state.md"), "utf-8");
+    expect(currentStateMarkdown).toContain("Goal for chapter 2");
+    const manifest = JSON.parse(await readFile(join(storyDir, "state", "manifest.json"), "utf-8"));
+    expect(manifest.lastAppliedChapter).toBe(2);
+    const stateSummaries = JSON.parse(await readFile(join(storyDir, "state", "chapter_summaries.json"), "utf-8"));
+    expect(stateSummaries.rows.map((row: { chapter: number }) => row.chapter)).toEqual([1, 2]);
+
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("keeps the whole-book lock for legacy books even when concurrentWrites is on", async () => {
+    const { root, runner, state, bookId } = await createRunnerFixture({
+      inputGovernanceMode: "legacy",
+      concurrentWrites: true,
+    });
+    // No story/state/manifest.json -> legacy markdown book.
+
+    vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(
+      createWriterOutput({
+        chapterNumber: 1,
+        content: "Legacy chapter body.",
+        wordCount: countChapterLength("Legacy chapter body.", "en_words"),
+        postWriteErrors: [],
+        postWriteWarnings: [],
+      }),
+    );
+    vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValue(
+      createAuditResult({ passed: true, issues: [], summary: "clean" }),
+    );
+
+    await runner.writeNextChapter(bookId);
+
+    // No journal files should be produced (the delta applier path is unused).
+    const runtimeDir = join(state.bookDir(bookId), "story", "runtime");
+    const runtimeFiles = await readdir(runtimeDir).catch(() => []);
+    expect(runtimeFiles.filter((file) => file.endsWith(".delta.json"))).toHaveLength(0);
+    // Reservations were never taken.
+    await expect(state.listActiveChapterReservations(bookId)).resolves.toEqual([]);
+
+    await rm(root, { recursive: true, force: true });
+  });
+
   it("repairs chapter-number drift in writer delta before persisting runtime state", async () => {
     const { root, runner, state, bookId } = await createRunnerFixture({
       inputGovernanceMode: "legacy",

@@ -3068,6 +3068,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       chapterReviewMode,
       revisionGate: overrides?.revisionGate ?? revisionGate,
       modelOverrides: currentConfig.modelOverrides,
+      concurrentWrites: currentConfig.writing?.concurrentWrites,
       notifyChannels: currentConfig.notify,
       logger,
       onContextCompression: (event) => {
@@ -3427,7 +3428,16 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
   app.delete("/api/v1/books/:id/chapters/:num", async (c) => {
     const id = c.req.param("id");
     const num = parseInt(c.req.param("num"), 10);
-    const releaseLock = await state.acquireBookLock(id);
+    const releaseLock = await state.acquireBookLock(id, {
+      scope: { kind: "book" },
+      timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+      pollMs: BOOK_LOCK_POLL_MS,
+    });
+    const releaseCommitLock = await state.acquireBookLock(id, {
+      scope: { kind: "commit" },
+      timeoutMs: BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
+      pollMs: BOOK_LOCK_POLL_MS,
+    });
     try {
       const result = await deleteLatestChapter(state, id, { chapterNumber: num });
       broadcast("chapter:deleted", { bookId: id, chapterNumber: result.deletedChapter });
@@ -3435,6 +3445,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     } catch (e) {
       return c.json({ error: e instanceof Error ? e.message : String(e) }, 400);
     } finally {
+      await releaseCommitLock();
       await releaseLock();
     }
   });
@@ -3783,10 +3794,16 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       }
 
       // rollbackToChapter rewrites the whole book truth set; take the exclusive
-      // book lock and wait for any in-flight write to finish before rolling back.
+      // book lock + the commit section and wait for any in-flight write before
+      // rolling back.
       const releaseLock = await state.acquireBookLock(id, {
         scope: { kind: "book" },
         timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+        pollMs: BOOK_LOCK_POLL_MS,
+      });
+      const releaseCommitLock = await state.acquireBookLock(id, {
+        scope: { kind: "commit" },
+        timeoutMs: BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
         pollMs: BOOK_LOCK_POLL_MS,
       });
       try {
@@ -3800,6 +3817,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           discarded,
         });
       } finally {
+        await releaseCommitLock();
         await releaseLock();
       }
     } catch (e) {
@@ -6107,11 +6125,17 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const { content } = await c.req.json<{ content: string }>();
     const { writeFile: writeFileFs, mkdir: mkdirFs } = await import("node:fs/promises");
     const { dirname: dirnameFs } = await import("node:path");
-    // Truth files are shared book state; take the exclusive book lock (with a
-    // bounded wait) so a concurrent write's commit cannot clobber this edit.
+    // Truth files are shared book state; take the exclusive book lock + the
+    // commit section (with a bounded wait) so a concurrent write's commit
+    // cannot clobber this edit.
     const releaseLock = await state.acquireBookLock(id, {
       scope: { kind: "book" },
       timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+      pollMs: BOOK_LOCK_POLL_MS,
+    });
+    const releaseCommitLock = await state.acquireBookLock(id, {
+      scope: { kind: "commit" },
+      timeoutMs: BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
       pollMs: BOOK_LOCK_POLL_MS,
     });
     try {
@@ -6119,6 +6143,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       await writeFileFs(resolved, content, "utf-8");
       return c.json({ ok: true });
     } finally {
+      await releaseCommitLock();
       await releaseLock();
     }
   });

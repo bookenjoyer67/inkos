@@ -493,4 +493,168 @@ describe("applyRuntimeStateDelta", () => {
       lastAdvancedChapter: 12,
     }));
   });
+
+  it("applies an out-of-order delta without regressing lastAppliedChapter", () => {
+    const result = applyRuntimeStateDelta({
+      snapshot: {
+        manifest: {
+          schemaVersion: 2,
+          language: "en",
+          lastAppliedChapter: 12,
+          projectionVersion: 1,
+          migrationWarnings: [],
+        },
+        currentState: {
+          chapter: 12,
+          facts: [],
+        },
+        hooks: {
+          hooks: [],
+        },
+        chapterSummaries: {
+          rows: [
+            {
+              chapter: 12,
+              title: "River-Port Ledger",
+              characters: "Lin Yue",
+              events: "12 already applied.",
+              stateChanges: "Twelve.",
+              hookActivity: "mentor-debt advanced",
+              mood: "tight",
+              chapterType: "investigation",
+            },
+          ],
+        },
+      },
+      delta: RuntimeStateDeltaSchema.parse({
+        chapter: 11,
+        hookOps: {
+          upsert: [],
+          resolve: [],
+          defer: [],
+        },
+        chapterSummary: {
+          chapter: 11,
+          title: "Old Ledger",
+          characters: "Lin Yue",
+          events: "11 lands after 12.",
+          stateChanges: "Eleven.",
+          hookActivity: "mentor-debt advanced",
+          mood: "tense",
+          chapterType: "mainline",
+        },
+        notes: [],
+      }),
+      allowOutOfOrder: true,
+    });
+
+    // lastAppliedChapter must not regress; the late summary row is merged in.
+    expect(result.manifest.lastAppliedChapter).toBe(12);
+    expect(result.currentState.chapter).toBe(12);
+    expect(result.chapterSummaries.rows.map((row) => row.chapter)).toEqual([11, 12]);
+    expect(result.chapterSummaries.rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ chapter: 11, events: "11 lands after 12." }),
+      ]),
+    );
+  });
+
+  it("replaces a stale summary row when reapplying a chapter out of order", () => {
+    const result = applyRuntimeStateDelta({
+      snapshot: {
+        manifest: {
+          schemaVersion: 2,
+          language: "zh",
+          lastAppliedChapter: 11,
+          projectionVersion: 1,
+          migrationWarnings: [],
+        },
+        currentState: {
+          chapter: 11,
+          facts: [],
+        },
+        hooks: {
+          hooks: [],
+        },
+        chapterSummaries: {
+          rows: [
+            {
+              chapter: 11,
+              title: "旧版河埠对账",
+              characters: "林月",
+              events: "旧摘要。",
+              stateChanges: "旧变化。",
+              hookActivity: "旧钩子",
+              mood: "紧绷",
+              chapterType: "主线推进",
+            },
+          ],
+        },
+      },
+      delta: RuntimeStateDeltaSchema.parse({
+        chapter: 11,
+        hookOps: {
+          upsert: [],
+          resolve: [],
+          defer: [],
+        },
+        chapterSummary: {
+          chapter: 11,
+          title: "新版河埠对账",
+          characters: "林月",
+          events: "重放后的新摘要。",
+          stateChanges: "新变化。",
+          hookActivity: "新钩子",
+          mood: "压抑",
+          chapterType: "修订",
+        },
+        notes: [],
+      }),
+      allowOutOfOrder: true,
+    });
+
+    expect(result.manifest.lastAppliedChapter).toBe(11);
+    expect(result.chapterSummaries.rows).toEqual([
+      expect.objectContaining({
+        chapter: 11,
+        title: "新版河埠对账",
+        events: "重放后的新摘要。",
+      }),
+    ]);
+  });
+
+  it("still rejects backward deltas without the out-of-order flag", () => {
+    expect(() =>
+      applyRuntimeStateDelta({
+        snapshot: {
+          manifest: {
+            schemaVersion: 2,
+            language: "en",
+            lastAppliedChapter: 12,
+            projectionVersion: 1,
+            migrationWarnings: [],
+          },
+          currentState: {
+            chapter: 12,
+            facts: [],
+          },
+          hooks: {
+            hooks: [],
+          },
+          chapterSummaries: {
+            rows: [],
+          },
+        },
+        delta: RuntimeStateDeltaSchema.parse({
+          chapter: 11,
+          hookOps: {
+            upsert: [],
+            resolve: [],
+            defer: [],
+          },
+          notes: [],
+        }),
+      }),
+    ).toThrow(/goes backwards/);
+  });
 });

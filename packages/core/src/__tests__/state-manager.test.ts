@@ -349,6 +349,75 @@ describe("StateManager", () => {
   });
 
   // -------------------------------------------------------------------------
+  // Chapter reservation
+  // -------------------------------------------------------------------------
+
+  describe("chapter reservations", () => {
+    it("allocates sequential numbers and tracks active reservations", async () => {
+      const bookId = "reserve-book-1";
+      await mkdir(manager.bookDir(bookId), { recursive: true });
+
+      const first = await manager.reserveNextChapterNumber(bookId);
+      const second = await manager.reserveNextChapterNumber(bookId);
+
+      expect(first).toBe(1);
+      expect(second).toBe(2);
+      await expect(manager.listActiveChapterReservations(bookId)).resolves.toEqual([1, 2]);
+    });
+
+    it("skips chapters already written on disk", async () => {
+      const bookId = "reserve-book-2";
+      const chapDir = join(manager.bookDir(bookId), "chapters");
+      await mkdir(chapDir, { recursive: true });
+      await writeFile(join(chapDir, "0001_Title.md"), "# Ch1", "utf-8");
+      await writeFile(join(chapDir, "0002_Title.md"), "# Ch2", "utf-8");
+
+      const next = await manager.reserveNextChapterNumber(bookId);
+      expect(next).toBe(3);
+    });
+
+    it("releases a reservation so the number can be reused", async () => {
+      const bookId = "reserve-book-3";
+      await mkdir(manager.bookDir(bookId), { recursive: true });
+
+      const first = await manager.reserveNextChapterNumber(bookId);
+      expect(first).toBe(1);
+      await manager.releaseChapterReservation(bookId, 1);
+      await expect(manager.listActiveChapterReservations(bookId)).resolves.toEqual([]);
+
+      const again = await manager.reserveNextChapterNumber(bookId);
+      expect(again).toBe(1);
+    });
+
+    it("prunes reservations from a dead pid", async () => {
+      const bookId = "reserve-book-4";
+      await mkdir(manager.bookDir(bookId), { recursive: true });
+
+      // Manually plant a reservation owned by a dead pid.
+      await writeFile(join(manager.bookDir(bookId), ".chapter-reservations.json"),
+        JSON.stringify({ version: 1, reservations: [{ chapter: 1, pid: 424242, startedAt: Date.now() }] }),
+        "utf-8");
+
+      const killSpy = vi.spyOn(process, "kill").mockImplementation((((pid: number) => {
+        if (pid === 424242) {
+          const error = new Error("no such process") as NodeJS.ErrnoException;
+          error.code = "ESRCH";
+          throw error;
+        }
+        return true;
+      }) as unknown) as typeof process.kill);
+
+      try {
+        const next = await manager.reserveNextChapterNumber(bookId);
+        expect(next).toBe(1);
+        await expect(manager.listActiveChapterReservations(bookId)).resolves.toEqual([1]);
+      } finally {
+        killSpy.mockRestore();
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // listBooks
   // -------------------------------------------------------------------------
 

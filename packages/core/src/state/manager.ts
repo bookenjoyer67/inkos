@@ -9,6 +9,25 @@ const BOOK_LOCK_HEARTBEAT_MS = 30_000;
 const BOOK_LOCK_LEASE_MS = 3 * 60_000;
 const BOOK_LOCK_RELEASE_RETRIES = 4;
 
+// Chapter-number reservation file + lease. A write job reserves its target
+// chapter under the commit lock before the long phase; the reservation is what
+// prevents two concurrent writers from allocating the same chapter number. It
+// is released on success/abort and pruned lazily when the owner pid dies or
+// the lease expires (crash safety).
+const CHAPTER_RESERVATIONS_FILE = ".chapter-reservations.json";
+const CHAPTER_RESERVATION_LEASE_MS = 30 * 60_000;
+
+interface ChapterReservation {
+  readonly chapter: number;
+  readonly pid: number;
+  readonly startedAt: number;
+}
+
+interface ChapterReservationsFile {
+  readonly version: 1;
+  readonly reservations: ReadonlyArray<ChapterReservation>;
+}
+
 // Defaults for waiting lock acquires (Phase 1: infra only; consumers opt in by
 // passing a timeoutMs > 0). Book-scope waits can legitimately span a whole
 // write job (~10 min), so the default is generous; commit-scope holds are
@@ -505,6 +524,92 @@ export class StateManager {
       fallbackChapter: durableChapter,
     });
     return durableChapter + 1;
+  }
+
+  private chapterReservationsPath(bookId: string): string {
+    return join(this.bookDir(bookId), CHAPTER_RESERVATIONS_FILE);
+  }
+
+  private async loadChapterReservations(bookId: string): Promise<ChapterReservationsFile> {
+    try {
+      const raw = await readFile(this.chapterReservationsPath(bookId), "utf-8");
+      const parsed = JSON.parse(raw) as { version?: unknown; reservations?: unknown };
+      if (parsed.version !== 1 || !Array.isArray(parsed.reservations)) {
+        return { version: 1, reservations: [] };
+      }
+      const reservations: ChapterReservation[] = [];
+      for (const entry of parsed.reservations as Array<Record<string, unknown>>) {
+        if (
+          typeof entry.chapter !== "number" || !Number.isInteger(entry.chapter) || entry.chapter <= 0
+          || typeof entry.pid !== "number"
+          || typeof entry.startedAt !== "number"
+        ) {
+          continue;
+        }
+        reservations.push({ chapter: entry.chapter, pid: entry.pid, startedAt: entry.startedAt });
+      }
+      return { version: 1, reservations };
+    } catch {
+      return { version: 1, reservations: [] };
+    }
+  }
+
+  private async saveChapterReservations(bookId: string, file: ChapterReservationsFile): Promise<void> {
+    const path = this.chapterReservationsPath(bookId);
+    const tmpPath = join(this.bookDir(bookId), `${CHAPTER_RESERVATIONS_FILE}.${process.pid}.${randomUUID()}.tmp`);
+    try {
+      await writeFile(tmpPath, `${JSON.stringify(file, null, 2)}\n`, "utf-8");
+      await rename(tmpPath, path);
+    } catch (error) {
+      await unlink(tmpPath).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private isReservationStale(reservation: ChapterReservation, durableChapter: number): boolean {
+    if (reservation.chapter <= durableChapter) return true; // already committed
+    if (reservation.pid !== process.pid && !this.isProcessAlive(reservation.pid)) return true;
+    return Date.now() - reservation.startedAt > CHAPTER_RESERVATION_LEASE_MS;
+  }
+
+  /** Allocate the next free chapter number and record a reservation. The
+   * caller must hold the book's `commit` lock while calling this, so two
+   * writers cannot allocate the same number. */
+  async reserveNextChapterNumber(bookId: string): Promise<number> {
+    const durableChapter = await resolveDurableStoryProgress({
+      bookDir: this.bookDir(bookId),
+    });
+    const file = await this.loadChapterReservations(bookId);
+    const live = file.reservations.filter((reservation) => !this.isReservationStale(reservation, durableChapter));
+    const taken = new Set(live.map((reservation) => reservation.chapter));
+    let next = durableChapter + 1;
+    while (taken.has(next)) next += 1;
+    await this.saveChapterReservations(bookId, {
+      version: 1,
+      reservations: [...live, { chapter: next, pid: process.pid, startedAt: Date.now() }],
+    });
+    return next;
+  }
+
+  /** Remove this process's reservation for a chapter (success or abort). */
+  async releaseChapterReservation(bookId: string, chapterNumber: number): Promise<void> {
+    const file = await this.loadChapterReservations(bookId);
+    const reservations = file.reservations.filter(
+      (reservation) => !(reservation.chapter === chapterNumber && reservation.pid === process.pid),
+    );
+    await this.saveChapterReservations(bookId, { ...file, reservations });
+  }
+
+  /** Pruned list of currently-live reservations (for diagnostics/tests). */
+  async listActiveChapterReservations(bookId: string): Promise<ReadonlyArray<number>> {
+    const durableChapter = await resolveDurableStoryProgress({
+      bookDir: this.bookDir(bookId),
+    });
+    const file = await this.loadChapterReservations(bookId);
+    return file.reservations
+      .filter((reservation) => !this.isReservationStale(reservation, durableChapter))
+      .map((reservation) => reservation.chapter)
+      .sort((left, right) => left - right);
   }
 
   async getPersistedChapterCount(bookId: string): Promise<number> {

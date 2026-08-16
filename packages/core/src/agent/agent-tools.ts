@@ -7,7 +7,12 @@ import { defaultChapterLength } from "../utils/length-metrics.js";
 import { inferLanguage } from "../utils/language.js";
 import { mkdir, readFile, writeFile, readdir, stat } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import { StateManager } from "../state/manager.js";
+import {
+  StateManager,
+  BOOK_LOCK_WAIT_TIMEOUT_MS,
+  BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
+  BOOK_LOCK_POLL_MS,
+} from "../state/manager.js";
 import { deleteLatestChapter } from "../state/chapter-delete.js";
 import { assertSafeTruthFileName, createInteractionToolsFromDeps } from "../interaction/project-tools.js";
 import { writeExportArtifact } from "../interaction/export-artifact.js";
@@ -2798,7 +2803,16 @@ export function createDeleteLatestChapterTool(
     async execute(_toolCallId, params): Promise<AgentToolResult<unknown>> {
       const bookId = resolveToolBookId("delete_latest_chapter", params.bookId, activeBookId);
       const state = new StateManager(projectRoot);
-      const releaseLock = await state.acquireBookLock(bookId);
+      const releaseLock = await state.acquireBookLock(bookId, {
+        scope: { kind: "book" },
+        timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+        pollMs: BOOK_LOCK_POLL_MS,
+      });
+      const releaseCommitLock = await state.acquireBookLock(bookId, {
+        scope: { kind: "commit" },
+        timeoutMs: BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
+        pollMs: BOOK_LOCK_POLL_MS,
+      });
       try {
         const result = await deleteLatestChapter(state, bookId, {
           chapterNumber: params.chapterNumber,
@@ -2811,6 +2825,7 @@ export function createDeleteLatestChapterTool(
           },
         );
       } finally {
+        await releaseCommitLock();
         await releaseLock();
       }
     },

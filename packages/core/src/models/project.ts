@@ -99,6 +99,12 @@ export const WritingConfigSchema = z.object({
   reviewRetries: z.number().int().min(0).max(10).default(1),
   reviewMode: z.enum(["auto", "manual"]).default("auto"),
   revisionGate: z.enum(["strict", "lenient", "always"]).default("strict"),
+  // Opt-in concurrent chapter writes (default off). When enabled, writeNextChapter
+  // holds only a chapter-scoped lock for the long LLM phase and a short commit
+  // section for the deterministic persist tail. Books without structured state
+  // (no runtimeStateDelta) and the writeChapters batch always use the whole-book
+  // lock regardless of this flag.
+  concurrentWrites: z.boolean().default(false),
 });
 
 export type WritingConfig = z.infer<typeof WritingConfigSchema>;

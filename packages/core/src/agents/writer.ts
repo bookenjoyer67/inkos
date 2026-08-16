@@ -695,6 +695,7 @@ export class WriterAgent extends BaseAgent {
     output: WriteChapterOutput,
     numericalSystem: boolean = true,
     language: "zh" | "en" = "zh",
+    options: { readonly chapterOnly?: boolean } = {},
   ): Promise<void> {
     const chaptersDir = join(bookDir, "chapters");
     await mkdir(chaptersDir, { recursive: true });
@@ -713,51 +714,59 @@ export class WriterAgent extends BaseAgent {
       "",
       output.content,
     ].join("\n");
-    const runtimeStateArtifacts = await this.resolveRuntimeStateArtifactsForOutput(
-      bookDir,
-      output,
-      language,
-    );
 
     const writes: AtomicFileWrite[] = [
       { relativePath: join("chapters", filename), content: chapterContent },
-      {
-        relativePath: join("story", "current_state.md"),
-        content: runtimeStateArtifacts?.currentStateMarkdown ?? output.updatedState,
-      },
-      {
-        relativePath: join("story", "pending_hooks.md"),
-        content: runtimeStateArtifacts?.hooksMarkdown ?? output.updatedHooks,
-      },
     ];
 
-    if (runtimeStateArtifacts?.chapterSummariesMarkdown) {
-      writes.push({
-        relativePath: join("story", "chapter_summaries.md"),
-        content: runtimeStateArtifacts.chapterSummariesMarkdown,
-      });
-    }
-
-    const runtimeStateSnapshot = runtimeStateArtifacts?.snapshot ?? output.runtimeStateSnapshot;
-    if (runtimeStateSnapshot) {
+    // chapterOnly: the concurrent-write persist path writes the chapter body
+    // (and particle ledger) here; the truth/state files are produced by the
+    // serialized journal applier instead, so they are skipped.
+    if (!options.chapterOnly) {
+      const runtimeStateArtifacts = await this.resolveRuntimeStateArtifactsForOutput(
+        bookDir,
+        output,
+        language,
+      );
       writes.push(
         {
-          relativePath: join("story", "state", "manifest.json"),
-          content: JSON.stringify(runtimeStateSnapshot.manifest, null, 2),
+          relativePath: join("story", "current_state.md"),
+          content: runtimeStateArtifacts?.currentStateMarkdown ?? output.updatedState,
         },
         {
-          relativePath: join("story", "state", "current_state.json"),
-          content: JSON.stringify(runtimeStateSnapshot.currentState, null, 2),
-        },
-        {
-          relativePath: join("story", "state", "hooks.json"),
-          content: JSON.stringify(runtimeStateSnapshot.hooks, null, 2),
-        },
-        {
-          relativePath: join("story", "state", "chapter_summaries.json"),
-          content: JSON.stringify(runtimeStateSnapshot.chapterSummaries, null, 2),
+          relativePath: join("story", "pending_hooks.md"),
+          content: runtimeStateArtifacts?.hooksMarkdown ?? output.updatedHooks,
         },
       );
+
+      if (runtimeStateArtifacts?.chapterSummariesMarkdown) {
+        writes.push({
+          relativePath: join("story", "chapter_summaries.md"),
+          content: runtimeStateArtifacts.chapterSummariesMarkdown,
+        });
+      }
+
+      const runtimeStateSnapshot = runtimeStateArtifacts?.snapshot ?? output.runtimeStateSnapshot;
+      if (runtimeStateSnapshot) {
+        writes.push(
+          {
+            relativePath: join("story", "state", "manifest.json"),
+            content: JSON.stringify(runtimeStateSnapshot.manifest, null, 2),
+          },
+          {
+            relativePath: join("story", "state", "current_state.json"),
+            content: JSON.stringify(runtimeStateSnapshot.currentState, null, 2),
+          },
+          {
+            relativePath: join("story", "state", "hooks.json"),
+            content: JSON.stringify(runtimeStateSnapshot.hooks, null, 2),
+          },
+          {
+            relativePath: join("story", "state", "chapter_summaries.json"),
+            content: JSON.stringify(runtimeStateSnapshot.chapterSummaries, null, 2),
+          },
+        );
+      }
     }
 
     if (numericalSystem) {

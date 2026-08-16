@@ -121,16 +121,21 @@ describe("interaction tools", () => {
       await tools.renameEntity("harbor", "Alpha", "Beta");
       await tools.patchChapterText("harbor", 1, "Gamma", "Delta");
 
-      // renameEntity is book-wide -> whole-book lock.
-      expect(acquireBookLock).toHaveBeenNthCalledWith(1, "harbor");
-      // patchChapterText claims the chapter scope + the short commit section.
-      expect(acquireBookLock).toHaveBeenNthCalledWith(2, "harbor", expect.objectContaining({
-        scope: { kind: "chapter", chapter: 1 },
+      // renameEntity is book-wide truth mutation -> whole-book + commit locks.
+      expect(acquireBookLock).toHaveBeenNthCalledWith(1, "harbor", expect.objectContaining({
+        scope: { kind: "book" },
       }));
-      expect(acquireBookLock).toHaveBeenNthCalledWith(3, "harbor", expect.objectContaining({
+      expect(acquireBookLock).toHaveBeenNthCalledWith(2, "harbor", expect.objectContaining({
         scope: { kind: "commit" },
       }));
-      expect(releases).toBe(3);
+      // patchChapterText claims the chapter scope + the short commit section.
+      expect(acquireBookLock).toHaveBeenNthCalledWith(3, "harbor", expect.objectContaining({
+        scope: { kind: "chapter", chapter: 1 },
+      }));
+      expect(acquireBookLock).toHaveBeenNthCalledWith(4, "harbor", expect.objectContaining({
+        scope: { kind: "commit" },
+      }));
+      expect(releases).toBe(4);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

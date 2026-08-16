@@ -156,6 +156,32 @@ async function withBookMutationLock<T>(
   }
 }
 
+// Whole-book ops that also rewrite shared truth/index state must additionally
+// hold the commit section so they serialize against concurrent write commits
+// (which hold commit during their persist tail).
+async function withTruthMutationLock<T>(
+  state: StateLike,
+  bookId: string,
+  task: () => Promise<T>,
+): Promise<T> {
+  const releaseLock = await state.acquireBookLock(bookId, {
+    scope: { kind: "book" },
+    timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+    pollMs: BOOK_LOCK_POLL_MS,
+  });
+  const releaseCommitLock = await state.acquireBookLock(bookId, {
+    scope: { kind: "commit" },
+    timeoutMs: BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
+    pollMs: BOOK_LOCK_POLL_MS,
+  });
+  try {
+    return await task();
+  } finally {
+    await releaseCommitLock();
+    await releaseLock();
+  }
+}
+
 export function buildChapterFileLookup(files: ReadonlyArray<string>): ReadonlyMap<number, string> {
   const lookup = new Map<number, string>();
   for (const file of files) {
@@ -545,7 +571,7 @@ export function createInteractionToolsFromDeps(
         pollMs: BOOK_LOCK_POLL_MS,
       },
     ),
-    renameEntity: async (bookId, oldValue, newValue) => withBookMutationLock(state, bookId, async () => {
+    renameEntity: async (bookId, oldValue, newValue) => withTruthMutationLock(state, bookId, async () => {
       const execution = await executeEditTransaction(
         {
           bookDir: (targetBookId) => state.bookDir(targetBookId),
@@ -566,15 +592,15 @@ export function createInteractionToolsFromDeps(
         },
       };
     }),
-    updateCurrentFocus: async (bookId, content) => withBookMutationLock(state, bookId, async () => {
+    updateCurrentFocus: async (bookId, content) => withTruthMutationLock(state, bookId, async () => {
       await state.ensureControlDocuments(bookId);
       await writeFile(join(state.bookDir(bookId), "story", "current_focus.md"), content, "utf-8");
     }),
-    updateAuthorIntent: async (bookId, content) => withBookMutationLock(state, bookId, async () => {
+    updateAuthorIntent: async (bookId, content) => withTruthMutationLock(state, bookId, async () => {
       await state.ensureControlDocuments(bookId);
       await writeFile(join(state.bookDir(bookId), "story", "author_intent.md"), content, "utf-8");
     }),
-    writeTruthFile: async (bookId, fileName, content) => withBookMutationLock(state, bookId, async () => {
+    writeTruthFile: async (bookId, fileName, content) => withTruthMutationLock(state, bookId, async () => {
       await state.ensureControlDocuments(bookId);
       const storyDir = join(state.bookDir(bookId), "story");
       const safeFileName = assertSafeTruthFileName(fileName);

@@ -27,6 +27,7 @@ import {
   BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
   BOOK_LOCK_POLL_MS,
 } from "../state/manager.js";
+import { writeChapterDeltaJournal, applyJournalToState } from "./state-journal.js";
 import { archiveChapterVersion, readChapterUserBrief } from "../state/chapter-workspace.js";
 import { MemoryDB, type Fact } from "../state/memory-db.js";
 import { dispatchNotification, dispatchWebhookEvent } from "../notify/dispatcher.js";
@@ -304,6 +305,7 @@ export interface PipelineConfig {
   readonly externalContext?: string;
   readonly modelOverrides?: Record<string, string | AgentLLMOverride>;
   readonly inputGovernanceMode?: InputGovernanceMode;
+  readonly concurrentWrites?: boolean;
   readonly logger?: Logger;
   readonly onStreamProgress?: OnStreamProgress;
   readonly onContextCompression?: ContextCompressionCallback;
@@ -1100,12 +1102,34 @@ export class PipelineRunner {
 
   /** Write a single draft chapter. Saves chapter file + truth files + index + snapshot. */
   async writeDraft(bookId: string, context?: string, wordCount?: number): Promise<DraftResult> {
-    const releaseLock = await this.state.acquireBookLock(bookId);
+    const concurrent = await this.shouldUseConcurrentWrites(bookId);
+    let reservedChapter: number | undefined;
+    let releaseChapterLock: (() => Promise<void>) | undefined;
+    let releaseBookLock: (() => Promise<void>) | undefined;
+    if (concurrent) {
+      const releaseCommitLock = await this.state.acquireBookLock(bookId, {
+        scope: { kind: "commit" },
+        timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+        pollMs: BOOK_LOCK_POLL_MS,
+      });
+      try {
+        reservedChapter = await this.state.reserveNextChapterNumber(bookId);
+        releaseChapterLock = await this.state.acquireBookLock(bookId, {
+          scope: { kind: "chapter", chapter: reservedChapter },
+          timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+          pollMs: BOOK_LOCK_POLL_MS,
+        });
+      } finally {
+        await releaseCommitLock();
+      }
+    } else {
+      releaseBookLock = await this.state.acquireBookLock(bookId);
+    }
     try {
       await this.state.ensureControlDocuments(bookId);
       const book = await this.state.loadBookConfig(bookId);
       const bookDir = this.state.bookDir(bookId);
-      const chapterNumber = await this.state.getNextChapterNumber(bookId);
+      const chapterNumber = reservedChapter ?? await this.state.getNextChapterNumber(bookId);
       const stageLanguage = await this.resolveBookLanguage(book);
       this.logStage(stageLanguage, { zh: "准备章节输入", en: "preparing chapter inputs" });
       const writeInput = await this.prepareWriteInput(
@@ -1180,39 +1204,63 @@ export class PipelineRunner {
         : `# 第${chapterNumber}章 ${draftOutput.title}`;
       await writeFile(filePath, `${heading}\n\n${draftOutput.content}`, "utf-8");
 
-      // Save truth files
+      // Save truth files. In concurrent-write mode this runs inside the commit
+      // critical section and the truth/state files come from the journal applier.
       this.logStage(stageLanguage, { zh: "落盘草稿与真相文件", en: "persisting draft and truth files" });
-      await writer.saveChapter(bookDir, draftOutput, gp.numericalSystem, resolvedLang);
-      await writer.saveNewTruthFiles(bookDir, draftOutput, resolvedLang);
-      await this.syncLegacyStructuredStateFromMarkdown(bookDir, chapterNumber, draftOutput);
-      await this.syncNarrativeMemoryIndex(bookId);
+      const releasePersistLock = concurrent
+        ? await this.state.acquireBookLock(bookId, {
+            scope: { kind: "commit" },
+            timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+            pollMs: BOOK_LOCK_POLL_MS,
+          })
+        : undefined;
+      try {
+        if (concurrent) {
+          await writer.saveChapter(bookDir, draftOutput, gp.numericalSystem, resolvedLang, { chapterOnly: true });
+          const delta = draftOutput.runtimeStateDelta;
+          if (delta) {
+            await writeChapterDeltaJournal(bookDir, chapterNumber, delta);
+            await applyJournalToState({ bookDir, uptoChapter: chapterNumber, language: resolvedLang });
+          } else {
+            await writer.saveNewTruthFiles(bookDir, draftOutput, resolvedLang);
+            await this.syncLegacyStructuredStateFromMarkdown(bookDir, chapterNumber, draftOutput);
+          }
+        } else {
+          await writer.saveChapter(bookDir, draftOutput, gp.numericalSystem, resolvedLang);
+          await writer.saveNewTruthFiles(bookDir, draftOutput, resolvedLang);
+          await this.syncLegacyStructuredStateFromMarkdown(bookDir, chapterNumber, draftOutput);
+        }
+        await this.syncNarrativeMemoryIndex(bookId);
 
-      // Update index
-      const existingIndex = await this.state.loadChapterIndex(bookId);
-      const now = new Date().toISOString();
-      const newEntry: ChapterMeta = {
-        number: chapterNumber,
-        title: draftOutput.title,
-        status: "drafted",
-        wordCount: draftOutput.wordCount,
-        createdAt: now,
-        updatedAt: now,
-        auditIssues: [],
-        lengthWarnings,
-        lengthTelemetry,
-        ...(draftOutput.tokenUsage ? { tokenUsage: draftOutput.tokenUsage } : {}),
-      };
-      const existingIdx = existingIndex.findIndex((e) => e.number === chapterNumber);
-      const updatedIndex = existingIdx >= 0
-        ? existingIndex.map((e, i) => i === existingIdx ? newEntry : e)
-        : [...existingIndex, newEntry];
-      await this.state.saveChapterIndex(bookId, updatedIndex);
-      await this.markBookActiveIfNeeded(bookId);
+        // Update index
+        const existingIndex = await this.state.loadChapterIndex(bookId);
+        const now = new Date().toISOString();
+        const newEntry: ChapterMeta = {
+          number: chapterNumber,
+          title: draftOutput.title,
+          status: "drafted",
+          wordCount: draftOutput.wordCount,
+          createdAt: now,
+          updatedAt: now,
+          auditIssues: [],
+          lengthWarnings,
+          lengthTelemetry,
+          ...(draftOutput.tokenUsage ? { tokenUsage: draftOutput.tokenUsage } : {}),
+        };
+        const existingIdx = existingIndex.findIndex((e) => e.number === chapterNumber);
+        const updatedIndex = existingIdx >= 0
+          ? existingIndex.map((e, i) => i === existingIdx ? newEntry : e)
+          : [...existingIndex, newEntry];
+        await this.state.saveChapterIndex(bookId, updatedIndex);
+        await this.markBookActiveIfNeeded(bookId);
 
-      // Snapshot
-      this.logStage(stageLanguage, { zh: "更新章节索引与快照", en: "updating chapter index and snapshots" });
-      await this.state.snapshotState(bookId, chapterNumber);
-      await this.syncCurrentStateFactHistory(bookId, chapterNumber);
+        // Snapshot
+        this.logStage(stageLanguage, { zh: "更新章节索引与快照", en: "updating chapter index and snapshots" });
+        await this.state.snapshotState(bookId, chapterNumber);
+        await this.syncCurrentStateFactHistory(bookId, chapterNumber);
+      } finally {
+        await releasePersistLock?.();
+      }
 
       await this.emitWebhook("chapter-complete", bookId, chapterNumber, {
         title: draftOutput.title,
@@ -1229,7 +1277,11 @@ export class PipelineRunner {
         tokenUsage: draftOutput.tokenUsage,
       };
     } finally {
-      await releaseLock();
+      await releaseBookLock?.();
+      await releaseChapterLock?.();
+      if (reservedChapter !== undefined) {
+        await this.state.releaseChapterReservation(bookId, reservedChapter);
+      }
     }
   }
 
@@ -1378,30 +1430,55 @@ export class PipelineRunner {
 
   /** Revise the latest (or specified) chapter based on audit issues. */
   async reviseDraft(bookId: string, chapterNumber?: number, mode: ReviseMode = DEFAULT_REVISE_MODE, externalContext?: string): Promise<ReviseResult> {
-    const releaseLock = await this.state.acquireBookLock(bookId);
-    try {
-      const book = await this.state.loadBookConfig(bookId);
-      const bookDir = this.state.bookDir(bookId);
-      const targetChapter = chapterNumber ?? (await this.state.getNextChapterNumber(bookId)) - 1;
-      if (targetChapter < 1) {
-        throw new Error(`No chapters to revise for "${bookId}"`);
-      }
+    this.throwIfOperationAborted();
+    // Determine the target chapter and whether it is the latest BEFORE locking,
+    // so the lock scope can be chosen: latest-chapter revision rewrites truth
+    // (book + commit, serializing against concurrent write commits), while
+    // non-latest revision only touches chapter-scoped files + the index (chapter
+    // + commit) and can run concurrently with writes on other chapters.
+    const book = await this.state.loadBookConfig(bookId);
+    const bookDir = this.state.bookDir(bookId);
+    const targetChapter = chapterNumber ?? (await this.state.getNextChapterNumber(bookId)) - 1;
+    if (targetChapter < 1) {
+      throw new Error(`No chapters to revise for "${bookId}"`);
+    }
+    const index = await this.state.loadChapterIndex(bookId);
+    const chapterMeta = index.find((ch) => ch.number === targetChapter);
+    if (!chapterMeta) {
+      throw new Error(`Chapter ${targetChapter} not found in index`);
+    }
+    const latestChapter = index.length > 0
+      ? Math.max(...index.map((chapter) => chapter.number))
+      : targetChapter;
+    const isLatestChapter = targetChapter === latestChapter;
 
+    let releaseChapterLock: (() => Promise<void>) | undefined;
+    let releaseBookLock: (() => Promise<void>) | undefined;
+    let releaseCommitLock: (() => Promise<void>) | undefined;
+    if (isLatestChapter) {
+      releaseBookLock = await this.state.acquireBookLock(bookId, {
+        scope: { kind: "book" },
+        timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+        pollMs: BOOK_LOCK_POLL_MS,
+      });
+      releaseCommitLock = await this.state.acquireBookLock(bookId, {
+        scope: { kind: "commit" },
+        timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+        pollMs: BOOK_LOCK_POLL_MS,
+      });
+    } else {
+      releaseChapterLock = await this.state.acquireBookLock(bookId, {
+        scope: { kind: "chapter", chapter: targetChapter },
+        timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+        pollMs: BOOK_LOCK_POLL_MS,
+      });
+    }
+    try {
       const stageLanguage = await this.resolveBookLanguage(book);
-      // Read the current audit issues from index
       this.logStage(stageLanguage, {
         zh: `加载第${targetChapter}章修订上下文`,
         en: `loading revision context for chapter ${targetChapter}`,
       });
-      const index = await this.state.loadChapterIndex(bookId);
-      const chapterMeta = index.find((ch) => ch.number === targetChapter);
-      if (!chapterMeta) {
-        throw new Error(`Chapter ${targetChapter} not found in index`);
-      }
-      const latestChapter = index.length > 0
-        ? Math.max(...index.map((chapter) => chapter.number))
-        : targetChapter;
-      const isLatestChapter = targetChapter === latestChapter;
 
       // Re-audit to get structured issues (index only stores strings)
       const content = await this.readChapterContent(bookDir, targetChapter);
@@ -1597,97 +1674,109 @@ export class PipelineRunner {
       }
       this.logLengthWarnings(lengthWarnings);
 
-      // Save revised chapter file
-      this.logStage(stageLanguage, {
-        zh: `落盘第${targetChapter}章修订结果`,
-        en: `persisting revision for chapter ${targetChapter}`,
-      });
-      const chaptersDir = join(bookDir, "chapters");
-      const files = await readdir(chaptersDir);
-      const paddedNum = String(targetChapter).padStart(4, "0");
-      const existingFile = files.find((f) => f.startsWith(paddedNum) && f.endsWith(".md"));
-      if (!existingFile) {
-        throw new Error(`Chapter ${targetChapter} file not found in ${chaptersDir} (expected filename starting with ${paddedNum})`);
-      }
-      await archiveChapterVersion(bookDir, targetChapter, content, "revision");
-      const reviseLang = book.language ?? gp.language;
-      const reviseHeading = reviseLang === "en"
-        ? `# Chapter ${targetChapter}: ${chapterMeta.title}`
-        : `# 第${targetChapter}章 ${chapterMeta.title}`;
-      await writeFile(
-        join(chaptersDir, existingFile),
-        `${reviseHeading}\n\n${normalizedRevision.content}`,
-        "utf-8",
-      );
+      // Save revised chapter file. Non-latest revisions still serialize their
+      // shared index/drift/truth writes under the short commit section.
+      const releasePersistCommit = isLatestChapter
+        ? undefined
+        : await this.state.acquireBookLock(bookId, {
+            scope: { kind: "commit" },
+            timeoutMs: BOOK_LOCK_COMMIT_WAIT_TIMEOUT_MS,
+            pollMs: BOOK_LOCK_POLL_MS,
+          });
+      try {
+        this.logStage(stageLanguage, {
+          zh: `落盘第${targetChapter}章修订结果`,
+          en: `persisting revision for chapter ${targetChapter}`,
+        });
+        const chaptersDir = join(bookDir, "chapters");
+        const files = await readdir(chaptersDir);
+        const paddedNum = String(targetChapter).padStart(4, "0");
+        const existingFile = files.find((f) => f.startsWith(paddedNum) && f.endsWith(".md"));
+        if (!existingFile) {
+          throw new Error(`Chapter ${targetChapter} file not found in ${chaptersDir} (expected filename starting with ${paddedNum})`);
+        }
+        await archiveChapterVersion(bookDir, targetChapter, content, "revision");
+        const reviseLang = book.language ?? gp.language;
+        const reviseHeading = reviseLang === "en"
+          ? `# Chapter ${targetChapter}: ${chapterMeta.title}`
+          : `# 第${targetChapter}章 ${chapterMeta.title}`;
+        await writeFile(
+          join(chaptersDir, existingFile),
+          `${reviseHeading}\n\n${normalizedRevision.content}`,
+          "utf-8",
+        );
 
-      // Only the latest chapter owns current truth. Reworking an older chapter
-      // invalidates its descendants, but must not rewind the live story state.
-      if (isLatestChapter) {
-        const storyDir = join(bookDir, "story");
-        if (reviseOutput.updatedState !== "(状态卡未更新)") {
-          await writeFile(join(storyDir, "current_state.md"), reviseOutput.updatedState, "utf-8");
+        // Only the latest chapter owns current truth. Reworking an older chapter
+        // invalidates its descendants, but must not rewind the live story state.
+        if (isLatestChapter) {
+          const storyDir = join(bookDir, "story");
+          if (reviseOutput.updatedState !== "(状态卡未更新)") {
+            await writeFile(join(storyDir, "current_state.md"), reviseOutput.updatedState, "utf-8");
+          }
+          if (gp.numericalSystem && reviseOutput.updatedLedger && reviseOutput.updatedLedger !== "(账本未更新)") {
+            await writeFile(join(storyDir, "particle_ledger.md"), reviseOutput.updatedLedger, "utf-8");
+          }
+          if (reviseOutput.updatedHooks !== "(伏笔池未更新)") {
+            await writeFile(join(storyDir, "pending_hooks.md"), reviseOutput.updatedHooks, "utf-8");
+          }
+          await this.syncLegacyStructuredStateFromMarkdown(bookDir, targetChapter);
         }
-        if (gp.numericalSystem && reviseOutput.updatedLedger && reviseOutput.updatedLedger !== "(账本未更新)") {
-          await writeFile(join(storyDir, "particle_ledger.md"), reviseOutput.updatedLedger, "utf-8");
-        }
-        if (reviseOutput.updatedHooks !== "(伏笔池未更新)") {
-          await writeFile(join(storyDir, "pending_hooks.md"), reviseOutput.updatedHooks, "utf-8");
-        }
-        await this.syncLegacyStructuredStateFromMarkdown(bookDir, targetChapter);
-      }
 
-      // Update index
-      const downstreamRevisionNotice = language === "en"
-        ? `[warning] Chapter ${targetChapter} changed; re-review this downstream chapter for continuity.`
-        : `[warning] 第${targetChapter}章已重写，请重新检查本章与前文的连续性。`;
-      const updatedIndex = index.map((ch) => {
-        if (ch.number === targetChapter) {
-          return {
+        // Update index
+        const downstreamRevisionNotice = language === "en"
+          ? `[warning] Chapter ${targetChapter} changed; re-review this downstream chapter for continuity.`
+          : `[warning] 第${targetChapter}章已重写，请重新检查本章与前文的连续性。`;
+        const updatedIndex = index.map((ch) => {
+          if (ch.number === targetChapter) {
+            return {
+                ...ch,
+                status: (effectivePostRevision.auditResult.passed ? "ready-for-review" : "audit-failed") as ChapterMeta["status"],
+                wordCount: normalizedRevision.wordCount,
+                updatedAt: new Date().toISOString(),
+                auditIssues: effectivePostRevision.auditResult.issues.map((i) => `[${i.severity}] ${i.description}`),
+                lengthWarnings,
+                lengthTelemetry,
+              };
+          }
+          if (ch.number > targetChapter) {
+            return {
               ...ch,
-              status: (effectivePostRevision.auditResult.passed ? "ready-for-review" : "audit-failed") as ChapterMeta["status"],
-              wordCount: normalizedRevision.wordCount,
+              status: "needs-revision" as ChapterMeta["status"],
               updatedAt: new Date().toISOString(),
-              auditIssues: effectivePostRevision.auditResult.issues.map((i) => `[${i.severity}] ${i.description}`),
-              lengthWarnings,
-              lengthTelemetry,
+              auditIssues: [
+                ...(ch.auditIssues ?? []).filter((issue) => !issue.includes("re-review this downstream chapter") && !issue.includes("请重新检查本章与前文")),
+                downstreamRevisionNotice,
+              ],
             };
+          }
+          return ch;
+        });
+        await this.state.saveChapterIndex(bookId, updatedIndex);
+        if (isLatestChapter) {
+          await this.persistAuditDriftGuidance({
+            bookDir,
+            chapterNumber: targetChapter,
+            issues: effectivePostRevision.auditResult.issues.filter(
+              (issue) => issue.severity === "critical" || issue.severity === "warning",
+            ),
+            language,
+          }).catch(() => undefined);
         }
-        if (ch.number > targetChapter) {
-          return {
-            ...ch,
-            status: "needs-revision" as ChapterMeta["status"],
-            updatedAt: new Date().toISOString(),
-            auditIssues: [
-              ...(ch.auditIssues ?? []).filter((issue) => !issue.includes("re-review this downstream chapter") && !issue.includes("请重新检查本章与前文")),
-              downstreamRevisionNotice,
-            ],
-          };
-        }
-        return ch;
-      });
-      await this.state.saveChapterIndex(bookId, updatedIndex);
-      if (isLatestChapter) {
-        await this.persistAuditDriftGuidance({
-          bookDir,
-          chapterNumber: targetChapter,
-          issues: effectivePostRevision.auditResult.issues.filter(
-            (issue) => issue.severity === "critical" || issue.severity === "warning",
-          ),
-          language,
-        }).catch(() => undefined);
-      }
 
-      // Re-snapshot
-      this.logStage(stageLanguage, {
-        zh: `更新第${targetChapter}章索引与快照`,
-        en: `updating chapter index and snapshots for chapter ${targetChapter}`,
-      });
-      if (isLatestChapter) {
-        await this.state.snapshotState(bookId, targetChapter);
-      }
-      await this.syncNarrativeMemoryIndex(bookId);
-      if (isLatestChapter) {
-        await this.syncCurrentStateFactHistory(bookId, targetChapter);
+        // Re-snapshot
+        this.logStage(stageLanguage, {
+          zh: `更新第${targetChapter}章索引与快照`,
+          en: `updating chapter index and snapshots for chapter ${targetChapter}`,
+        });
+        if (isLatestChapter) {
+          await this.state.snapshotState(bookId, targetChapter);
+        }
+        await this.syncNarrativeMemoryIndex(bookId);
+        if (isLatestChapter) {
+          await this.syncCurrentStateFactHistory(bookId, targetChapter);
+        }
+      } finally {
+        await releasePersistCommit?.();
       }
 
       await this.emitWebhook("revision-complete", bookId, targetChapter, {
@@ -1705,7 +1794,9 @@ export class PipelineRunner {
         lengthTelemetry,
       };
     } finally {
-      await releaseLock();
+      await releaseCommitLock?.();
+      await releaseBookLock?.();
+      await releaseChapterLock?.();
     }
   }
 
@@ -1767,11 +1858,75 @@ export class PipelineRunner {
 
   async writeNextChapter(bookId: string, wordCount?: number, temperatureOverride?: number): Promise<ChapterPipelineResult> {
     this.throwIfOperationAborted();
-    const releaseLock = await this.state.acquireBookLock(bookId);
+    if (!(await this.shouldUseConcurrentWrites(bookId))) {
+      const releaseLock = await this.state.acquireBookLock(bookId);
+      try {
+        return await this._writeNextChapterLocked(bookId, wordCount, temperatureOverride, this.config.externalContext);
+      } finally {
+        await releaseLock();
+      }
+    }
+    return this._writeNextChapterConcurrent(bookId, wordCount, temperatureOverride, this.config.externalContext);
+  }
+
+  /**
+   * Concurrent-write path (opt-in via `writing.concurrentWrites`).
+   *
+   * Reserve the target chapter number under the commit lock, then hold only the
+   * chapter-scoped lock across the long LLM phase. The deterministic persist
+   * tail re-acquires the commit lock and journals the chapter's state delta so
+   * the serialized applier folds it over the freshest snapshot. Two writers on
+   * different chapters can therefore run their LLM phases concurrently; only
+   * reservations and the sub-second persist tails serialize.
+   */
+  private async _writeNextChapterConcurrent(
+    bookId: string,
+    wordCount?: number,
+    temperatureOverride?: number,
+    externalContext?: string,
+  ): Promise<ChapterPipelineResult> {
+    this.throwIfOperationAborted();
+    let reservedChapter = 0;
+    let releaseChapterLock: (() => Promise<void>) | undefined;
+    const releaseCommitLock = await this.state.acquireBookLock(bookId, {
+      scope: { kind: "commit" },
+      timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+      pollMs: BOOK_LOCK_POLL_MS,
+    });
     try {
-      return await this._writeNextChapterLocked(bookId, wordCount, temperatureOverride, this.config.externalContext);
+      reservedChapter = await this.state.reserveNextChapterNumber(bookId);
+      releaseChapterLock = await this.state.acquireBookLock(bookId, {
+        scope: { kind: "chapter", chapter: reservedChapter },
+        timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+        pollMs: BOOK_LOCK_POLL_MS,
+      });
     } finally {
-      await releaseLock();
+      await releaseCommitLock();
+    }
+
+    try {
+      return await this._writeNextChapterLocked(
+        bookId,
+        wordCount,
+        temperatureOverride,
+        externalContext,
+        reservedChapter,
+      );
+    } finally {
+      await releaseChapterLock?.();
+      await this.state.releaseChapterReservation(bookId, reservedChapter);
+    }
+  }
+
+  private async shouldUseConcurrentWrites(bookId: string): Promise<boolean> {
+    if (!this.config.concurrentWrites) return false;
+    // Only books with structured state (which produce delta journal entries)
+    // can use the journal applier; legacy markdown books stay whole-book locked.
+    try {
+      await stat(join(this.state.stateDir(bookId), "manifest.json"));
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -1807,19 +1962,39 @@ export class PipelineRunner {
   }
 
   async repairChapterState(bookId: string, chapterNumber?: number): Promise<ChapterPipelineResult> {
-    const releaseLock = await this.state.acquireBookLock(bookId);
+    const releaseLock = await this.state.acquireBookLock(bookId, {
+      scope: { kind: "book" },
+      timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+      pollMs: BOOK_LOCK_POLL_MS,
+    });
+    const releaseCommitLock = await this.state.acquireBookLock(bookId, {
+      scope: { kind: "commit" },
+      timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+      pollMs: BOOK_LOCK_POLL_MS,
+    });
     try {
       return await this._repairChapterStateLocked(bookId, chapterNumber);
     } finally {
+      await releaseCommitLock();
       await releaseLock();
     }
   }
 
   async resyncChapterArtifacts(bookId: string, chapterNumber?: number): Promise<ChapterPipelineResult> {
-    const releaseLock = await this.state.acquireBookLock(bookId);
+    const releaseLock = await this.state.acquireBookLock(bookId, {
+      scope: { kind: "book" },
+      timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+      pollMs: BOOK_LOCK_POLL_MS,
+    });
+    const releaseCommitLock = await this.state.acquireBookLock(bookId, {
+      scope: { kind: "commit" },
+      timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+      pollMs: BOOK_LOCK_POLL_MS,
+    });
     try {
       return await this._resyncChapterArtifactsLocked(bookId, chapterNumber);
     } finally {
+      await releaseCommitLock();
       await releaseLock();
     }
   }
@@ -1829,13 +2004,15 @@ export class PipelineRunner {
     wordCount?: number,
     temperatureOverride?: number,
     externalContext?: string,
+    reservedChapterNumber?: number,
   ): Promise<ChapterPipelineResult> {
     this.throwIfOperationAborted();
+    const concurrent = reservedChapterNumber !== undefined;
     await this.state.ensureControlDocuments(bookId);
     const book = await this.state.loadBookConfig(bookId);
     const bookDir = this.state.bookDir(bookId);
     await this.assertNoPendingStateRepair(bookId);
-    const chapterNumber = await this.state.getNextChapterNumber(bookId);
+    const chapterNumber = reservedChapterNumber ?? await this.state.getNextChapterNumber(bookId);
     const stageLanguage = await this.resolveBookLanguage(book);
     this.logStage(stageLanguage, { zh: "准备章节输入", en: "preparing chapter inputs" });
     const writeInput = await this.prepareWriteInput(
@@ -1985,7 +2162,13 @@ export class PipelineRunner {
           const promotionResult = rerunPromotionPass(hooks, summariesRaw);
           if (promotionResult.updated) {
             const ledgerLang: "zh" | "en" = /[\u4e00-\u9fff]/.test(ledgerRaw) ? "zh" : "en";
-            await writeFile(ledgerPath, renderHookSnapshot([...promotionResult.hooks], ledgerLang), "utf-8");
+            // In concurrent-write mode the ledger is (re)written by the journal
+            // applier under the commit lock; writing it here would interleave
+            // with another chapter's commit, so promotion is applied lazily by
+            // the next chapter's settlement instead.
+            if (!concurrent) {
+              await writeFile(ledgerPath, renderHookSnapshot([...promotionResult.hooks], ledgerLang), "utf-8");
+            }
             this.config.logger?.info(`[promotion] ${promotionResult.flippedCount} hook(s) promoted after chapter ${chapterNumber}`);
           }
         }
@@ -2154,37 +2337,71 @@ export class PipelineRunner {
     }
 
     const resolvedStatus = chapterStatus ?? (auditResult.passed ? "ready-for-review" : "audit-failed");
-    await persistChapterArtifacts({
-      chapterNumber,
-      chapterTitle: persistenceOutput.title,
-      status: resolvedStatus,
-      auditResult,
-      finalWordCount,
-      lengthWarnings,
-      lengthTelemetry,
-      degradedIssues,
-      tokenUsage: totalUsage,
-      loadChapterIndex: () => this.state.loadChapterIndex(bookId),
-      saveChapter: () => writer.saveChapter(bookDir, persistenceOutput, gp.numericalSystem, pipelineLang),
-      saveTruthFiles: async () => {
-        await writer.saveNewTruthFiles(bookDir, persistenceOutput, pipelineLang);
-        await this.syncLegacyStructuredStateFromMarkdown(bookDir, chapterNumber, persistenceOutput);
-        this.logStage(stageLanguage, { zh: "同步记忆索引", en: "syncing memory indexes" });
-        await this.syncNarrativeMemoryIndex(bookId);
-      },
-      saveChapterIndex: (index) => this.state.saveChapterIndex(bookId, index),
-      markBookActiveIfNeeded: () => this.markBookActiveIfNeeded(bookId),
-      persistAuditDriftGuidance: (issues) => this.persistAuditDriftGuidance({
-        bookDir,
+    // Concurrent-write mode: the persist tail (journal + applier + truth + index)
+    // runs inside the short commit critical section. The chapter lock is already
+    // held by the caller, so acquisition order stays chapter → commit.
+    const releasePersistLock = concurrent
+      ? await this.state.acquireBookLock(bookId, {
+          scope: { kind: "commit" },
+          timeoutMs: BOOK_LOCK_WAIT_TIMEOUT_MS,
+          pollMs: BOOK_LOCK_POLL_MS,
+        })
+      : undefined;
+    try {
+      await persistChapterArtifacts({
         chapterNumber,
-        issues,
-        language: stageLanguage,
-      }).catch(() => undefined),
-      snapshotState: () => this.state.snapshotState(bookId, chapterNumber),
-      syncCurrentStateFactHistory: () => this.syncCurrentStateFactHistory(bookId, chapterNumber),
-      logSnapshotStage: () =>
-        this.logStage(stageLanguage, { zh: "更新章节索引与快照", en: "updating chapter index and snapshots" }),
-    });
+        chapterTitle: persistenceOutput.title,
+        status: resolvedStatus,
+        auditResult,
+        finalWordCount,
+        lengthWarnings,
+        lengthTelemetry,
+        degradedIssues,
+        tokenUsage: totalUsage,
+        loadChapterIndex: () => this.state.loadChapterIndex(bookId),
+        saveChapter: concurrent
+          ? async () => {
+            await writer.saveChapter(bookDir, persistenceOutput, gp.numericalSystem, pipelineLang, { chapterOnly: true });
+            const delta = persistenceOutput.runtimeStateDelta;
+            if (delta) {
+              await writeChapterDeltaJournal(bookDir, chapterNumber, delta);
+              await applyJournalToState({
+                bookDir,
+                uptoChapter: chapterNumber,
+                language: pipelineLang,
+              });
+            } else {
+              // Structured book without a delta this turn (defensive): fall back
+              // to the deterministic legacy truth write so truth still lands.
+              await writer.saveNewTruthFiles(bookDir, persistenceOutput, pipelineLang);
+              await this.syncLegacyStructuredStateFromMarkdown(bookDir, chapterNumber, persistenceOutput);
+            }
+          }
+          : () => writer.saveChapter(bookDir, persistenceOutput, gp.numericalSystem, pipelineLang),
+        saveTruthFiles: async () => {
+          if (!concurrent) {
+            await writer.saveNewTruthFiles(bookDir, persistenceOutput, pipelineLang);
+            await this.syncLegacyStructuredStateFromMarkdown(bookDir, chapterNumber, persistenceOutput);
+          }
+          this.logStage(stageLanguage, { zh: "同步记忆索引", en: "syncing memory indexes" });
+          await this.syncNarrativeMemoryIndex(bookId);
+        },
+        saveChapterIndex: (index) => this.state.saveChapterIndex(bookId, index),
+        markBookActiveIfNeeded: () => this.markBookActiveIfNeeded(bookId),
+        persistAuditDriftGuidance: (issues) => this.persistAuditDriftGuidance({
+          bookDir,
+          chapterNumber,
+          issues,
+          language: stageLanguage,
+        }).catch(() => undefined),
+        snapshotState: () => this.state.snapshotState(bookId, chapterNumber),
+        syncCurrentStateFactHistory: () => this.syncCurrentStateFactHistory(bookId, chapterNumber),
+        logSnapshotStage: () =>
+          this.logStage(stageLanguage, { zh: "更新章节索引与快照", en: "updating chapter index and snapshots" }),
+      });
+    } finally {
+      await releasePersistLock?.();
+    }
 
     // 6. Send notification
     if (this.config.notifyChannels && this.config.notifyChannels.length > 0) {

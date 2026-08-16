@@ -26,6 +26,11 @@ export function applyRuntimeStateDelta(params: {
   readonly snapshot: RuntimeStateSnapshot;
   readonly delta: RuntimeStateDelta;
   readonly allowReapply?: boolean;
+  // For out-of-order commits (a lower chapter landing after a higher one was
+  // applied): skip the backward guard, keep lastAppliedChapter at the max, and
+  // replace any pre-existing summary row for the chapter. Only the serialized
+  // applier path sets this.
+  readonly allowOutOfOrder?: boolean;
 }): RuntimeStateSnapshot {
   const snapshot = {
     manifest: StateManifestSchema.parse(params.snapshot.manifest),
@@ -35,19 +40,23 @@ export function applyRuntimeStateDelta(params: {
   };
   const delta = RuntimeStateDeltaSchema.parse(params.delta);
   const allowReapply = params.allowReapply ?? false;
+  const allowOutOfOrder = params.allowOutOfOrder ?? false;
 
-  if (allowReapply ? delta.chapter < snapshot.manifest.lastAppliedChapter : delta.chapter <= snapshot.manifest.lastAppliedChapter) {
-    throw new Error(`delta chapter ${delta.chapter} goes backwards`);
+  if (!allowOutOfOrder) {
+    if (allowReapply ? delta.chapter < snapshot.manifest.lastAppliedChapter : delta.chapter <= snapshot.manifest.lastAppliedChapter) {
+      throw new Error(`delta chapter ${delta.chapter} goes backwards`);
+    }
   }
 
   if (delta.chapterSummary && delta.chapterSummary.chapter !== delta.chapter) {
     throw new Error(`chapter summary ${delta.chapterSummary.chapter} does not match delta chapter ${delta.chapter}`);
   }
 
+  const replaceSummaryRow = allowReapply || allowOutOfOrder;
   if (
     delta.chapterSummary
     && snapshot.chapterSummaries.rows.some((row) => row.chapter === delta.chapterSummary?.chapter)
-    && !allowReapply
+    && !replaceSummaryRow
   ) {
     throw new Error(`duplicate summary row for chapter ${delta.chapterSummary.chapter}`);
   }
@@ -58,14 +67,21 @@ export function applyRuntimeStateDelta(params: {
     snapshot.manifest.language,
     delta,
   );
-  const chapterSummaries = applySummaryDelta(snapshot.chapterSummaries, delta, allowReapply);
+  const chapterSummaries = applySummaryDelta(snapshot.chapterSummaries, delta, replaceSummaryRow);
+
+  const resolvedChapter = allowOutOfOrder
+    ? Math.max(snapshot.manifest.lastAppliedChapter, delta.chapter)
+    : delta.chapter;
 
   const next: RuntimeStateSnapshot = {
     manifest: {
       ...snapshot.manifest,
-      lastAppliedChapter: delta.chapter,
+      lastAppliedChapter: resolvedChapter,
     },
-    currentState,
+    currentState: {
+      ...currentState,
+      chapter: resolvedChapter,
+    },
     hooks,
     chapterSummaries,
   };

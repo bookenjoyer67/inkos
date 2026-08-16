@@ -2939,8 +2939,13 @@ describe("createStudioServer daemon lifecycle", () => {
       "demo-book",
       { chapterNumber: 3 },
     );
-    // Chapter deletion is a whole-book rollback: still the default book lock.
-    expect(acquireBookLockMock).toHaveBeenCalledWith("demo-book");
+    // Chapter deletion is a whole-book rollback: book + commit locks.
+    expect(acquireBookLockMock).toHaveBeenCalledWith("demo-book", expect.objectContaining({
+      scope: { kind: "book" },
+    }));
+    expect(acquireBookLockMock).toHaveBeenCalledWith("demo-book", expect.objectContaining({
+      scope: { kind: "commit" },
+    }));
   });
 
   it("exposes a resync endpoint for rebuilding latest chapter truth artifacts", async () => {
